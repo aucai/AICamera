@@ -25,7 +25,13 @@ import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.aucai.aicamera.databinding.ActivityGalleryBinding
 import com.aucai.aicamera.ui.ReviewStore
+import com.aucai.aicamera.cloud.CloudException
+import com.aucai.aicamera.cloud.CloudSettings
+import com.aucai.aicamera.cloud.VisionClient
+import com.aucai.aicamera.core.CloudPrompts
+import com.aucai.aicamera.core.CloudReview
 import com.aucai.aicamera.ui.CheckText
+import com.aucai.aicamera.ui.CloudSettingsDialog
 import com.aucai.aicamera.ui.ShutterButton
 import java.util.concurrent.Executors
 
@@ -42,6 +48,7 @@ class GalleryActivity : AppCompatActivity() {
     private val photos = ArrayList<Photo>()
     private val adapter = PhotoAdapter()
     private var pendingDelete: Photo? = null
+    private var aiLoading = false
 
     private val deleteRequest =
         registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
@@ -76,6 +83,7 @@ class GalleryActivity : AppCompatActivity() {
         binding.btnBack.setOnClickListener { finish() }
         binding.btnShare.setOnClickListener { current()?.let { share(it) } }
         binding.btnDelete.setOnClickListener { current()?.let { confirmDelete(it) } }
+        binding.btnAiReview.setOnClickListener { current()?.let { askAiReview(it) } }
 
         loadPhotos()
     }
@@ -120,11 +128,22 @@ class GalleryActivity : AppCompatActivity() {
         if (photo == null) return
 
         val review = reviews.get(photo.name)
+        if (review != null && review.checks.isEmpty() && review.ai != null) {
+            // Only an AI review (photo from before reviews were recorded).
+            binding.score.text = "AI"
+            binding.score.background.mutate().setTint(getColor(R.color.accent))
+            binding.verdict.text = "AI 点评"
+            binding.scene.text = ""
+            binding.pills.visibility = View.GONE
+            binding.tips.visibility = View.VISIBLE
+            binding.tips.text = aiLines(review.ai).joinToString("\n")
+            return
+        }
         if (review == null) {
             binding.score.text = "—"
             binding.score.background.mutate().setTint(getColor(R.color.text_secondary))
             binding.verdict.text = "没有点评"
-            binding.scene.text = "这张不是用当前版本拍的，没有记录拍摄时的分析"
+            binding.scene.text = "没有拍摄时的分析记录，可以点「AI 点评」让 AI 看看"
             binding.pills.visibility = View.GONE
             binding.tips.visibility = View.GONE
             return
@@ -141,11 +160,53 @@ class GalleryActivity : AppCompatActivity() {
         binding.pills.visibility = View.VISIBLE
         binding.pills.text = CheckText.format(this, review.checks)
         val lines = ArrayList<String>()
-        if (review.reason.isNotEmpty()) lines += "AI 取景：${review.reason}"
+        review.ai?.let { lines += aiLines(it) }
+        if (review.reason.isNotEmpty()) lines += "取景：${review.reason}"
         if (review.blurry) lines += "照片可能有点糊，下次拿稳手机，或先点一下主体对焦"
         lines += review.tips
         binding.tips.visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
-        binding.tips.text = lines.take(5).joinToString("\n") { "· $it" }
+        binding.tips.text = lines.take(6).joinToString("\n") { if (it.startsWith("AI ")) it else "· $it" }
+    }
+
+    private fun aiLines(ai: CloudReview) = listOfNotNull(
+        ai.good.ifBlank { null }?.let { "AI 👍 $it" },
+        ai.improve.ifBlank { null }?.let { "AI ✎ $it" },
+        ai.nextTime.ifBlank { null }?.let { "AI → 下次：$it" },
+    )
+
+    /** Sends the photo to the cloud model for a short review and keeps the answer with the photo. */
+    private fun askAiReview(photo: Photo) {
+        val config = CloudSettings.load(this)
+        if (!config.ready) {
+            CloudSettingsDialog.show(this) { askAiReview(photo) }
+            return
+        }
+        if (aiLoading) return
+        aiLoading = true
+        binding.btnAiReview.text = "点评中…"
+        val scene = reviews.get(photo.name)?.scene?.ifEmpty { null } ?: "未知"
+        loader.execute {
+            val result = try {
+                val bmp = decode(photo.uri, 1280) ?: throw CloudException("读取照片失败")
+                val soft = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                val text = VisionClient(config).ask(CloudPrompts.SYSTEM, CloudPrompts.reviewRequest(scene), soft)
+                CloudPrompts.parseReview(text)?.let { Result.success(it) }
+                    ?: Result.failure(CloudException("AI 的回答格式不对，再试一次"))
+            } catch (e: CloudException) {
+                Result.failure(e)
+            }
+            runOnUiThread {
+                aiLoading = false
+                if (isDestroyed) return@runOnUiThread
+                binding.btnAiReview.text = getString(R.string.ai_review)
+                result.onSuccess {
+                    reviews.putAi(photo.name, it)
+                    if (current() == photo) showReview()
+                }.onFailure {
+                    Toast.makeText(this, "AI 点评失败：${it.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
 
     private fun share(photo: Photo) {

@@ -26,6 +26,9 @@ class GuidanceEngine {
 
     fun reset() = composition.reset()
 
+    /** Use the cloud model's framing for the current subject (null drops it). */
+    fun setExternal(f: ExternalFraming?) = composition.aim.setExternal(f)
+
     fun analyze(nowMs: Long, input: GuidanceInput): GuidanceFrame {
         val subject = SubjectPicker.pick(input.pose, input.objects, input.luma, composition.currentSubject)
         val comp = composition.update(nowMs, subject, input.pose, input.aim)

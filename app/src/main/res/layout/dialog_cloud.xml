@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="24dp"
+        android:paddingTop="8dp"
+        android:paddingEnd="24dp">
+
+        <RadioGroup
+            android:id="@+id/presets"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <RadioButton
+                android:id="@+id/presetQwen"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="通义千问（阿里云百炼）" />
+
+            <RadioButton
+                android:id="@+id/presetDoubao"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="豆包（火山方舟）" />
+
+            <RadioButton
+                android:id="@+id/presetCustom"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="其他 OpenAI 兼容接口" />
+        </RadioGroup>
+
+        <EditText
+            android:id="@+id/baseUrl"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="接口地址"
+            android:importantForAutofill="no"
+            android:inputType="textUri"
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/model"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="模型名"
+            android:importantForAutofill="no"
+            android:inputType="text"
+            android:textSize="14sp" />
+
+        <EditText
+            android:id="@+id/apiKey"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="API Key"
+            android:importantForAutofill="no"
+            android:inputType="textPassword"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/keyHelp"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="点「AI建议」时会把当前取景画面发给你选的云服务分析，Key 只保存在这台手机上。"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>

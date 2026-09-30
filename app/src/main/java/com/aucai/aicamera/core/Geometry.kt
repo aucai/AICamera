@@ -74,22 +74,3 @@ fun lineTiltDeg(a: Vec2, b: Vec2, aspect: Float): Float {
 }
 
 fun approxEq(a: Float, b: Float, tol: Float) = abs(a - b) <= tol
-
-/**
- * Maps a rect in display-normalized coordinates back to the camera image it came from, which was
- * rotated clockwise by [rotationDeg] and then (front camera) mirrored to get to display orientation.
- */
-fun displayToSource(r: RectN, rotationDeg: Int, mirrored: Boolean): RectN {
-    fun map(x0: Float, y0: Float): Vec2 {
-        val x = if (mirrored) 1f - x0 else x0
-        return when (rotationDeg) {
-            90 -> Vec2(y0, 1f - x)
-            180 -> Vec2(1f - x, 1f - y0)
-            270 -> Vec2(1f - y0, x)
-            else -> Vec2(x, y0)
-        }
-    }
-    val a = map(r.left, r.top)
-    val b = map(r.right, r.bottom)
-    return RectN(minOf(a.x, b.x), minOf(a.y, b.y), maxOf(a.x, b.x), maxOf(a.y, b.y))
-}

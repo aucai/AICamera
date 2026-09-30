@@ -12,4 +12,8 @@
     <string name="back">返回</string>
     <string name="share">分享</string>
     <string name="delete">删除</string>
+    <string name="ai_advice">AI建议</string>
+    <string name="ai_advice_title">AI 构图建议</string>
+    <string name="close">关闭</string>
+    <string name="ai_review">AI 点评</string>
 </resources>

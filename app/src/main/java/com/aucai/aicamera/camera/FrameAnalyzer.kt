@@ -8,6 +8,7 @@ import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.aucai.aicamera.core.AimInput
+import com.aucai.aicamera.core.ExternalFraming
 import com.aucai.aicamera.core.GuidanceEngine
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.GuidanceInput
@@ -37,6 +38,13 @@ class FrameAnalyzer(
     /** Set from any thread to drop tracking state, e.g. after switching cameras. */
     @Volatile var resetRequested = false
 
+    /** Called once with the next upright frame and its analysis, e.g. to send it to the cloud. */
+    @Volatile var snapshotListener: ((Bitmap, GuidanceFrame) -> Unit)? = null
+
+    /** Framing from the cloud to hand to the engine on the analysis thread. */
+    @Volatile var pendingExternal: ExternalFraming? = null
+    @Volatile var clearExternal = false
+
     private val engine = GuidanceEngine()
     private var detector: PoseDetector? = null
     private var detectorFailed = false
@@ -64,7 +72,19 @@ class FrameAnalyzer(
             val frameAspect = upright.width.toFloat() / upright.height
             val aim = AimInput(frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled)
             val input = GuidanceInput(pose, objects, luma, aim)
+            if (clearExternal) {
+                clearExternal = false
+                engine.setExternal(null)
+            }
+            pendingExternal?.let {
+                pendingExternal = null
+                engine.setExternal(it)
+            }
             val frame = engine.analyze(now, input)
+            snapshotListener?.let {
+                snapshotListener = null
+                it(upright, frame)
+            }
             onResult(frame, upright.width, upright.height)
         } catch (t: Throwable) {
             Log.e(TAG, "analysis failed", t)
@@ -116,7 +136,7 @@ class FrameAnalyzer(
     companion object {
         private const val TAG = "FrameAnalyzer"
         private const val GRID_LONG_SIDE = 64
-        private const val OBJECT_INTERVAL_MS = 300L
+        private const val OBJECT_INTERVAL_MS = 500L
 
         fun sampleLuma(bitmap: Bitmap): LumaGrid {
             val landscape = bitmap.width >= bitmap.height

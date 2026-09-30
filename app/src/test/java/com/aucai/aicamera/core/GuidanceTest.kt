@@ -83,16 +83,6 @@ class GuidanceTest {
         PoseFrame(landmarks.map { it.copy(x = 0.5f + (it.x - 0.5f) * k, y = 0.5f + (it.y - 0.5f) * k) }, aspect)
 
     @Test
-    fun displayToSourceInvertsRotationAndMirror() {
-        val r = RectN(0.1f, 0.2f, 0.5f, 0.6f)
-        assertEquals(r, displayToSource(r, 0, false))
-        // 90° clockwise: display (x, y) came from source (y, 1 - x).
-        assertEquals(RectN(0.2f, 0.5f, 0.6f, 0.9f), displayToSource(r, 90, false))
-        // Mirrored first: x → 1 - x.
-        assertEquals(RectN(0.5f, 0.2f, 0.9f, 0.6f), displayToSource(r, 0, true))
-    }
-
-    @Test
     fun levelMathRollSign() {
         // Phone rotated 10° clockwise: gravity reaction leans towards -x.
         val s = LevelMath.compute(-1.7f, 9.65f, 0f, 0)
@@ -325,5 +315,66 @@ class GuidanceTest {
         assertTrue(c.contains(Check(true, "人物完整")))
         val empty = Checklist.build(CompositionTracker().feed(0, null), goodLight(), level, null, emptyList())
         assertEquals(Check(false, "没找到主体"), empty.first())
+    }
+
+    @Test
+    fun parsesAdviceWithFencesAndThousandScaleBox() {
+        val text = """
+            好的，下面是建议：
+            ```json
+            {"scene":"公园里半身人像，顺光","good":"光线柔和","problem":"人物太靠中间",
+             "advice":"手机往右移一点","steps":["向右移","拉近一点"],"pose":"微微侧身",
+             "crop":[100,50,700,850]}
+            ```
+        """.trimIndent()
+        val a = CloudPrompts.parseAdvice(text, 480, 640)!!
+        assertEquals("手机往右移一点", a.advice)
+        assertEquals(listOf("向右移", "拉近一点"), a.steps)
+        assertEquals(RectN(0.1f, 0.05f, 0.7f, 0.85f), a.crop)
+    }
+
+    @Test
+    fun boxInPixelsOrFractionsIsNormalised() {
+        // Values above 1000 can only be pixels of the sent image (we ask for 0..1000).
+        val px = CloudPrompts.parseAdvice("""{"advice":"x","crop":[96,128,864,1152]}""", 960, 1280)!!
+        assertEquals(0.1f, px.crop!!.left, 1e-4f)
+        assertEquals(0.9f, px.crop!!.bottom, 1e-4f)
+        val frac = CloudPrompts.parseAdvice("""{"advice":"x","crop":[0.2,0.2,0.8,0.8]}""", 480, 640)!!
+        assertEquals(RectN(0.2f, 0.2f, 0.8f, 0.8f), frac.crop)
+    }
+
+    @Test
+    fun wholeImageOrBrokenBoxMeansNoCrop() {
+        assertNull(CloudPrompts.parseAdvice("""{"advice":"x","crop":[0,0,1000,1000]}""", 480, 640)!!.crop)
+        assertNull(CloudPrompts.parseAdvice("""{"advice":"x","crop":[500,500,510,510]}""", 480, 640)!!.crop)
+        assertNull(CloudPrompts.parseAdvice("""{"advice":"x","crop":"left"}""", 480, 640)!!.crop)
+        assertNull(CloudPrompts.parseAdvice("对不起，我无法回答", 480, 640))
+    }
+
+    @Test
+    fun parsesReview() {
+        val r = CloudPrompts.parseReview("""{"good":"光线好","improve":"地平线歪了","nextTime":"拍之前看水平仪"}""")!!
+        assertEquals("地平线歪了", r.improve)
+    }
+
+    @Test
+    fun cloudFramingDrivesTheAimAndSkipsAngleAdvice() {
+        val t = CompositionTracker()
+        val p = person(fullBody = true)
+        // Looking down at a full-body shot would normally trigger angle advice first.
+        val input = aimInput(pitch = 15f)
+        t.feed(0, p, input)
+        t.aim.setExternal(ExternalFraming(Vec2(0.1f, 0.05f), Vec2(0.5f, 0.5f), 1f, "往右移"))
+        val r = t.feed(100, p, input)
+        assertTrue(r.aim.external)
+        assertEquals(AimPhase.GUIDE, r.aim.phase)
+        val a = r.frameSubject!!.anchor
+        assertEquals(a.x + 0.1f, r.aim.target!!.x, 1e-3f)
+        assertEquals(a.y + 0.05f, r.aim.target!!.y, 1e-3f)
+        assertEquals(Vec2(0.5f, 0.5f), r.aim.view)
+        assertEquals("往右移", r.aim.reason)
+        // Dropping it goes back to the built-in recommendation.
+        t.aim.setExternal(null)
+        assertFalse(t.feed(200, p, input).aim.external)
     }
 }

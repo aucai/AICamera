@@ -2,6 +2,7 @@ package com.aucai.aicamera.ui
 
 import android.content.Context
 import com.aucai.aicamera.core.Check
+import com.aucai.aicamera.core.CloudReview
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -14,6 +15,8 @@ data class PhotoReview(
     val checks: List<Check>,
     val tips: List<String>,
     val blurry: Boolean = false,
+    /** The cloud model's review, once asked for in the gallery. */
+    val ai: CloudReview? = null,
 )
 
 /** Keeps a review per photo (keyed by file name) in a small JSON file in app storage. */
@@ -36,6 +39,15 @@ class ReviewStore(context: Context) {
         val all = load()
         val r = all.optJSONObject(name) ?: return
         r.put("blurry", true)
+        save(all)
+    }
+
+    @Synchronized
+    fun putAi(name: String, review: CloudReview) {
+        val all = load()
+        val r = all.optJSONObject(name) ?: encode(PhotoReview("", "", emptyList(), emptyList()))
+        r.put("ai", JSONObject().put("good", review.good).put("improve", review.improve).put("next", review.nextTime))
+        all.put(name, r)
         save(all)
     }
 
@@ -78,6 +90,7 @@ class ReviewStore(context: Context) {
             },
             tips = (0 until tips.length()).map { tips.getString(it) },
             blurry = o.optBoolean("blurry"),
+            ai = o.optJSONObject("ai")?.let { CloudReview(it.optString("good"), it.optString("improve"), it.optString("next")) },
         )
     } catch (e: Exception) {
         null

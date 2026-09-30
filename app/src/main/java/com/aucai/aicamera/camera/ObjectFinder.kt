@@ -12,7 +12,7 @@ import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import java.io.Closeable
 
-/** MediaPipe object detector (EfficientDet-Lite0, 80 COCO classes). Not thread-safe. */
+/** MediaPipe object detector (EfficientDet-Lite2, 80 COCO classes). Not thread-safe. */
 class ObjectFinder(context: Context) : Closeable {
 
     private val detector: ObjectDetector
@@ -20,7 +20,7 @@ class ObjectFinder(context: Context) : Closeable {
 
     init {
         val base = BaseOptions.builder()
-            .setModelAssetPath("efficientdet_lite0.tflite")
+            .setModelAssetPath("efficientdet_lite2.tflite")
             .setDelegate(Delegate.CPU)
             .build()
         val options = ObjectDetector.ObjectDetectorOptions.builder()

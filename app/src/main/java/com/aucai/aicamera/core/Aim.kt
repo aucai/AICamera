@@ -48,6 +48,9 @@ data class AngleGuide(val offsetDeg: Float, val text: String)
  *   It is fixed to the scene, so it moves as the phone moves; aim the centre ring at it.
  * @property zoomTo zoom ratio the camera should move to (ZOOM phase only).
  * @property reason why this framing was recommended.
+ * @property view size (normalized, at the current zoom) of the recommended framing around [target];
+ *   set when the framing came from the cloud model so it can be drawn.
+ * @property external the framing came from the cloud model rather than the built-in rules.
  */
 data class AimState(
     val phase: AimPhase,
@@ -56,7 +59,16 @@ data class AimState(
     val angle: AngleGuide? = null,
     val hint: String = "",
     val reason: String = "",
+    val view: Vec2? = null,
+    val external: Boolean = false,
 )
+
+/**
+ * A framing chosen by the cloud model, relative to the subject so it stays fixed to the scene.
+ * @property offset recommended view centre minus the subject anchor, at [zoomBase].
+ * @property size recommended view width/height (normalized) at [zoomBase].
+ */
+data class ExternalFraming(val offset: Vec2, val size: Vec2, val zoomBase: Float, val reason: String)
 
 /** Recommended camera angle per kind of subject (back camera). */
 object AngleAdvisor {
@@ -94,7 +106,13 @@ class AimAssist(
     private val settleMs: Long = 400,
     private val holdMs: Long = 400,
 ) {
-    private class Recommendation(val offset: Vec2, val zoomMul: Float, val zoomBase: Float, val reason: String)
+    private class Recommendation(
+        val offset: Vec2,
+        val zoomMul: Float,
+        val zoomBase: Float,
+        val reason: String,
+        val size: Vec2? = null,
+    )
 
     private var rec: Recommendation? = null
     private var phase = AimPhase.IDLE
@@ -104,6 +122,24 @@ class AimAssist(
     private var angleDone = false
     private var angleWasOff = false
     private var style: PortraitStyle? = null
+
+    val hasExternal get() = rec?.size != null
+
+    /** Aim at the cloud model's framing instead of the built-in one, until the subject changes. */
+    fun setExternal(f: ExternalFraming?) {
+        if (f == null) {
+            if (hasExternal) {
+                rec = null
+                phase = AimPhase.IDLE
+            }
+            return
+        }
+        val zoomMul = (1f / maxOf(f.size.x, f.size.y)).coerceAtLeast(1f)
+        rec = Recommendation(f.offset, zoomMul, f.zoomBase, f.reason, f.size)
+        phase = AimPhase.GUIDE
+        // The model already judged the angle; do not interrupt with angle advice.
+        angleDone = true
+    }
 
     fun reset() {
         rec = null
@@ -128,7 +164,7 @@ class AimAssist(
         if (subjectSince == NEVER) subjectSince = nowMs
 
         // 1. Angle first: tilting changes the vertical framing, so settle it before aiming.
-        angleState(nowMs, s, input)?.let { return it }
+        if (!hasExternal) angleState(nowMs, s, input)?.let { return it }
 
         // 2. Recommend once the subject has been there a moment and the phone is still; then keep it.
         var r = rec
@@ -174,7 +210,10 @@ class AimAssist(
             AimPhase.DONE -> "构图完成，可以拍了"
             else -> ""
         }
-        return AimState(phase, target, if (phase == AimPhase.ZOOM) zoomGoal else null, null, hint, r.reason)
+        val view = r.size?.let { Vec2(it.x * k, it.y * k) }
+        return AimState(
+            phase, target, if (phase == AimPhase.ZOOM) zoomGoal else null, null, hint, r.reason, view, r.size != null,
+        )
     }
 
     private fun angleState(nowMs: Long, s: FrameSubject, input: AimInput): AimState? {

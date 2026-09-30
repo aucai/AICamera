@@ -47,12 +47,24 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.aucai.aicamera.camera.FrameAnalyzer
+import com.aucai.aicamera.cloud.CloudException
+import com.aucai.aicamera.cloud.CloudSettings
+import com.aucai.aicamera.cloud.VisionClient
+import com.aucai.aicamera.core.CloudAdvice
+import com.aucai.aicamera.core.CloudPrompts
+import com.aucai.aicamera.core.ExternalFraming
+import com.aucai.aicamera.core.Vec2
+import com.aucai.aicamera.ui.CloudSettingsDialog
+import android.content.ContentValues
+import android.graphics.ImageDecoder
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import com.aucai.aicamera.camera.LevelSensor
-import com.aucai.aicamera.camera.PhotoWriter
 import com.aucai.aicamera.core.AimPhase
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.PortraitStyle
-import com.aucai.aicamera.core.RectN
 import com.aucai.aicamera.core.Severity
 import com.aucai.aicamera.core.Sharpness
 import com.aucai.aicamera.core.SubjectKind
@@ -78,6 +90,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var levelSensor: LevelSensor
     private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val photoExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val cloudExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val poseTipStabilizer = TipStabilizer(showAfterMs = 800, hideAfterMs = 1500)
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
@@ -112,6 +125,8 @@ class MainActivity : AppCompatActivity() {
     private var faceMeterAt = 0L
     private var faceMeterX = -1f
     private var faceMeterY = -1f
+    private var adviceLoading = false
+    private var extensionActive = false
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -161,6 +176,7 @@ class MainActivity : AppCompatActivity() {
         analysisExecutor.execute { analyzer.close() }
         analysisExecutor.shutdown()
         photoExecutor.shutdown()
+        cloudExecutor.shutdown()
         speaker?.shutdown()
     }
 
@@ -212,10 +228,7 @@ class MainActivity : AppCompatActivity() {
             .build()
         val fullResolution = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            // ~12 MP keeps a decoded frame comfortably in memory.
-            .setResolutionStrategy(
-                ResolutionStrategy(Size(4000, 3000), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
-            )
+            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
             .build()
         val analysisSize = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
@@ -272,6 +285,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
         camera = cam
+        extensionActive = bound != null
+        showQualityStatus()
         this.preview = preview
         imageCapture = capture
         imageAnalysis = analysis
@@ -483,14 +498,16 @@ class MainActivity : AppCompatActivity() {
         capture(frame)
     }
 
-    /** Captures at full resolution, turns the image upright (mirrored for selfies) and saves it. */
+    /**
+     * Saves the camera's own JPEG straight to the gallery (no decoding and re-compressing, so no quality
+     * is lost), then checks a small copy for blur.
+     */
     private fun capture(frame: GuidanceFrame?) {
         val capture = imageCapture ?: run {
             capturing = false
             return
         }
         val fileName = "AICamera_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
-        val mirror = lensFacing == CameraSelector.LENS_FACING_FRONT
 
         // Remember what the camera saw, for the review in the gallery.
         if (frame != null) {
@@ -503,30 +520,29 @@ class MainActivity : AppCompatActivity() {
             reviews.put(fileName, PhotoReview(frame.scene, reason, frame.checks, tips))
         }
 
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+        }
+        val metadata = ImageCapture.Metadata().apply {
+            // Save selfies mirrored, exactly as they looked in the preview.
+            isReversedHorizontal = lensFacing == CameraSelector.LENS_FACING_FRONT
+        }
+        val options = ImageCapture.OutputFileOptions
+            .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            .setMetadata(metadata)
+            .build()
+
         flash()
-        capture.takePicture(photoExecutor, object : ImageCapture.OnImageCapturedCallback() {
-            override fun onCaptureSuccess(image: ImageProxy) {
-                val saved = try {
-                    val rotation = image.imageInfo.rotationDegrees
-                    val src = image.toBitmap()
-                    image.close()
-                    val out = PhotoWriter.cropUpright(src, RectN(0f, 0f, 1f, 1f), rotation, mirror)
-                    val blurry = PhotoWriter.sharpness(out) < Sharpness.BLURRY_BELOW
-                    if (blurry) reviews.markBlurry(fileName)
-                    PhotoWriter.save(contentResolver, out, fileName)?.let { it to blurry }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "saving photo failed", t)
-                    runCatching { image.close() }
-                    null
-                }
+        capture.takePicture(options, photoExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                val uri = output.savedUri
+                val blurry = uri != null && isBlurry(uri)
+                if (blurry) reviews.markBlurry(fileName)
                 runOnUiThread {
                     capturing = false
-                    if (isDestroyed) return@runOnUiThread
-                    if (saved == null) {
-                        toast("保存照片失败")
-                        return@runOnUiThread
-                    }
-                    val (uri, blurry) = saved
+                    if (isDestroyed || uri == null) return@runOnUiThread
                     lastPhotoUri = uri
                     showThumbnail(uri)
                     showCaptureNote(if (blurry) "这张可能有点糊，拿稳再拍一张" else "已保存，点左下角看点评", 2500)
@@ -541,6 +557,135 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         })
+    }
+
+    private fun isBlurry(uri: Uri): Boolean = try {
+        val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, info, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            val scale = 1000f / maxOf(info.size.width, info.size.height)
+            if (scale < 1f) decoder.setTargetSize((info.size.width * scale).toInt(), (info.size.height * scale).toInt())
+        }
+        val px = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        val gray = IntArray(px.size) { i ->
+            val c = px[i]
+            (299 * ((c shr 16) and 0xff) + 587 * ((c shr 8) and 0xff) + 114 * (c and 0xff)) / 1000
+        }
+        Sharpness.laplacianVariance(gray, bmp.width, bmp.height) < Sharpness.BLURRY_BELOW
+    } catch (e: Exception) {
+        false
+    }
+
+    // -------------------------------------------------------------- cloud AI
+
+    /** Sends the current view to the cloud model and shows its advice; its framing drives the aiming guide. */
+    private fun requestAdvice() {
+        if (adviceLoading) return
+        val config = CloudSettings.load(this)
+        if (!config.ready) {
+            CloudSettingsDialog.show(this) { requestAdvice() }
+            return
+        }
+        adviceLoading = true
+        binding.advicePanel.visibility = View.VISIBLE
+        binding.adviceProgress.visibility = View.VISIBLE
+        binding.adviceText.text = "AI 正在看画面…"
+        binding.overlay.staticFrame = null
+        analyzer.clearExternal = true
+        val zoomAtShot = analyzer.zoom
+        val front = lensFacing == CameraSelector.LENS_FACING_FRONT
+        analyzer.snapshotListener = { image, frame ->
+            cloudExecutor.execute {
+                val result = try {
+                    val prompt = CloudPrompts.adviceRequest(image.width, image.height, contextFor(frame), front)
+                    val text = VisionClient(config).ask(CloudPrompts.SYSTEM, prompt, image)
+                    CloudPrompts.parseAdvice(text, image.width, image.height)
+                        ?.let { Result.success(it) }
+                        ?: Result.failure(CloudException("AI 的回答格式不对，再试一次"))
+                } catch (e: CloudException) {
+                    Result.failure(e)
+                }
+                runOnUiThread { showAdvice(result, frame, zoomAtShot) }
+            }
+        }
+    }
+
+    /** What the camera already knows, to give the model some context. */
+    private fun contextFor(frame: GuidanceFrame): String {
+        val parts = arrayListOf(frame.scene)
+        frame.composition.frameSubject?.let { if (it.facing != 0) parts += if (it.facing > 0) "人物朝画面右侧" else "人物朝画面左侧" }
+        levelHint()?.let { parts += it }
+        return parts.joinToString("；")
+    }
+
+    private fun levelHint(): String? {
+        val lv = analyzer.level ?: return null
+        if (lv.flat) return "手机平放俯拍"
+        val parts = ArrayList<String>()
+        if (abs(lv.rollDeg) > 3f) parts += "手机歪了%.0f°".format(abs(lv.rollDeg))
+        if (abs(lv.cameraPitchDeg) > 10f) parts += if (lv.cameraPitchDeg > 0) "镜头向下俯拍" else "镜头向上仰拍"
+        return parts.joinToString("，").ifEmpty { null }
+    }
+
+    private fun showAdvice(result: Result<CloudAdvice>, frame: GuidanceFrame, zoomAtShot: Float) {
+        adviceLoading = false
+        if (isDestroyed) return
+        binding.adviceProgress.visibility = View.GONE
+        val advice = result.getOrElse {
+            binding.adviceText.text = "失败：${it.message}\n（长按「AI建议」可以修改云端设置）"
+            return
+        }
+        val good = ContextCompat.getColor(this, R.color.good)
+        val bad = ContextCompat.getColor(this, R.color.bad)
+        val accent = ContextCompat.getColor(this, R.color.accent)
+        val secondary = ContextCompat.getColor(this, R.color.text_secondary)
+        val t = SpannableStringBuilder()
+        fun line(text: String, vararg spans: Any) {
+            if (text.isBlank()) return
+            if (t.isNotEmpty()) t.append("\n")
+            val start = t.length
+            t.append(text)
+            for (sp in spans) t.setSpan(sp, start, t.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        line(advice.scene, ForegroundColorSpan(secondary))
+        if (advice.good.isNotBlank()) line("✓ " + advice.good, ForegroundColorSpan(good))
+        if (advice.problem.isNotBlank()) line("✗ " + advice.problem, ForegroundColorSpan(bad))
+        line(advice.advice, StyleSpan(android.graphics.Typeface.BOLD), ForegroundColorSpan(accent))
+        advice.steps.forEachIndexed { i, step -> line("${i + 1}. $step") }
+        if (advice.pose.isNotBlank()) line("姿势：" + advice.pose)
+
+        val crop = advice.crop
+        val anchor = frame.composition.frameSubject?.anchor
+        when {
+            crop != null && anchor != null -> {
+                // Fix the framing to the subject so it follows the scene as the phone moves.
+                analyzer.pendingExternal = ExternalFraming(
+                    offset = Vec2(crop.center.x - anchor.x, crop.center.y - anchor.y),
+                    size = Vec2(crop.width, crop.height),
+                    zoomBase = zoomAtShot,
+                    reason = advice.advice,
+                )
+                line("黄色虚线框是推荐取景：把圆点对进中间的圈", ForegroundColorSpan(secondary))
+            }
+            crop != null -> {
+                binding.overlay.staticFrame = crop
+                line("黄色虚线框是推荐取景（移动手机后会消失）", ForegroundColorSpan(secondary))
+            }
+        }
+        binding.adviceText.text = t
+        if (voiceOn) speaker?.say(advice.advice, force = true)
+    }
+
+    private fun closeAdvice() {
+        binding.advicePanel.visibility = View.GONE
+        binding.overlay.staticFrame = null
+        analyzer.clearExternal = true
+    }
+
+    private fun showQualityStatus() {
+        binding.qualityChip.visibility = View.VISIBLE
+        binding.qualityChip.text = if (extensionActive) "厂商画质增强：开" else "厂商画质增强：本机不支持"
+        if (!extensionActive) mainHandler.postDelayed({ binding.qualityChip.visibility = View.GONE }, 4000)
     }
 
     private fun flash() {
@@ -633,6 +778,12 @@ class MainActivity : AppCompatActivity() {
                 }, 1500)
             }
         }
+        binding.btnAi.setOnClickListener { requestAdvice() }
+        binding.btnAi.setOnLongClickListener {
+            CloudSettingsDialog.show(this)
+            true
+        }
+        binding.adviceClose.setOnClickListener { closeAdvice() }
         binding.chipClose.setOnClickListener { chooseStyle(PortraitStyle.CLOSE) }
         binding.chipScene.setOnClickListener { chooseStyle(PortraitStyle.SCENE) }
 

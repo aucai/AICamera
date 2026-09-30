@@ -3,6 +3,7 @@ package com.aucai.aicamera.ui
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
@@ -13,6 +14,7 @@ import com.aucai.aicamera.core.AimPhase
 import com.aucai.aicamera.core.AimState
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.LevelState
+import com.aucai.aicamera.core.RectN
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -35,6 +37,10 @@ class GuideOverlayView @JvmOverloads constructor(
     var level: LevelState? = null
         set(value) { field = value; invalidate() }
 
+    /** A recommended framing that is not tied to a tracked subject (drawn as is). */
+    var staticFrame: RectN? = null
+        set(value) { field = value; invalidate() }
+
     private var frame: GuidanceFrame? = null
     private var frameW = 3
     private var frameH = 4
@@ -52,13 +58,16 @@ class GuideOverlayView @JvmOverloads constructor(
     private val angleFixed = stroke(Color.WHITE, 2f)
     private val angleMoving = stroke(yellow, 2.5f)
     private val shadow = Color.argb(120, 0, 0, 0)
+    private val framePaint = stroke(yellow, 2f).apply {
+        pathEffect = DashPathEffect(floatArrayOf(10 * dp, 7 * dp), 0f)
+    }
 
     private val image = RectF()
     private val arrow = Path()
 
     init {
         // Soft shadows keep thin white lines readable on bright scenes.
-        for (p in listOf(ringPaint, dotPaint, arrowPaint, levelPaint, angleFixed, angleMoving)) {
+        for (p in listOf(ringPaint, dotPaint, arrowPaint, levelPaint, angleFixed, angleMoving, framePaint)) {
             p.setShadowLayer(3 * dp, 0f, 0f, shadow)
         }
     }
@@ -97,6 +106,12 @@ class GuideOverlayView @JvmOverloads constructor(
             AimPhase.GUIDE, AimPhase.HOLD, AimPhase.ZOOM, AimPhase.DONE -> drawAim(canvas, aim)
             else -> Unit
         }
+        staticFrame?.let { r ->
+            canvas.drawRect(
+                image.left + r.left * image.width(), image.top + r.top * image.height(),
+                image.left + r.right * image.width(), image.top + r.bottom * image.height(), framePaint,
+            )
+        }
         drawLevel(canvas, ringVisible = aim != null && aim.phase != AimPhase.IDLE)
     }
 
@@ -119,6 +134,12 @@ class GuideOverlayView @JvmOverloads constructor(
         val t = aim.target ?: return
         val tx = image.left + t.x * image.width()
         val ty = image.top + t.y * image.height()
+        // The cloud model's framing, fixed to the scene around the target.
+        aim.view?.let { v ->
+            val hw = v.x * image.width() / 2f
+            val hh = v.y * image.height() / 2f
+            canvas.drawRect(tx - hw, ty - hh, tx + hw, ty + hh, framePaint)
+        }
         if (image.contains(tx, ty)) {
             dotPaint.color = if (aligned) yellow else Color.WHITE
             canvas.drawCircle(tx, ty, 7 * dp, dotPaint)
