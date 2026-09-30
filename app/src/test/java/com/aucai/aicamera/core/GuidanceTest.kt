@@ -364,7 +364,7 @@ class GuidanceTest {
         // Looking down at a full-body shot would normally trigger angle advice first.
         val input = aimInput(pitch = 15f)
         t.feed(0, p, input)
-        t.aim.setExternal(ExternalFraming(Vec2(0.1f, 0.05f), Vec2(0.5f, 0.5f), 1f, "往右移"))
+        t.aim.setExternal(ExternalFraming(Vec2(0.5f, 0.5f), 1f, "往右移", offset = Vec2(0.1f, 0.05f)))
         val r = t.feed(100, p, input)
         assertTrue(r.aim.external)
         assertEquals(AimPhase.GUIDE, r.aim.phase)
@@ -376,5 +376,103 @@ class GuidanceTest {
         // Dropping it goes back to the built-in recommendation.
         t.aim.setExternal(null)
         assertFalse(t.feed(200, p, input).aim.external)
+    }
+
+    // ---- Pinning targets in space with the orientation sensor --------------------------------
+
+    private val geometry = ViewGeometry(0.5f, 0.66f)
+
+    /** Phone held upright facing north, turned [yawDeg] to the right and [pitchDeg] up. */
+    private fun phone(yawDeg: Float = 0f, pitchDeg: Float = 0f): FloatArray {
+        // Device→world for an upright phone facing north: x→east, y→up, z (towards the user)→south.
+        val base = floatArrayOf(1f, 0f, 0f, 0f, 0f, -1f, 0f, 1f, 0f)
+        val p = Math.toRadians(pitchDeg.toDouble())
+        // Tilting the camera up rotates about the device x axis.
+        val pitch = floatArrayOf(
+            1f, 0f, 0f,
+            0f, Math.cos(p).toFloat(), -Math.sin(p).toFloat(),
+            0f, Math.sin(p).toFloat(), Math.cos(p).toFloat(),
+        )
+        val y = Math.toRadians(-yawDeg.toDouble())
+        val yaw = floatArrayOf(
+            Math.cos(y).toFloat(), -Math.sin(y).toFloat(), 0f,
+            Math.sin(y).toFloat(), Math.cos(y).toFloat(), 0f,
+            0f, 0f, 1f,
+        )
+        return mul(yaw, mul(base, pitch))
+    }
+
+    private fun mul(a: FloatArray, b: FloatArray) = FloatArray(9) { i ->
+        val r = i / 3
+        val c = i % 3
+        a[3 * r] * b[c] + a[3 * r + 1] * b[3 + c] + a[3 * r + 2] * b[6 + c]
+    }
+
+    @Test
+    fun anchorRoundTrips() {
+        val r = phone(20f, 5f)
+        val p = Vec2(0.3f, 0.7f)
+        val back = SceneAnchor.toScreen(SceneAnchor.toWorld(p, r, geometry), r, geometry)!!
+        assertEquals(p.x, back.x, 1e-4f)
+        assertEquals(p.y, back.y, 1e-4f)
+    }
+
+    @Test
+    fun turningRightMovesTheTargetLeft() {
+        val world = SceneAnchor.toWorld(Vec2(0.5f, 0.5f), phone(), geometry)
+        val after = SceneAnchor.toScreen(world, phone(yawDeg = 10f), geometry)!!
+        val expected = 0.5f - Math.tan(Math.toRadians(10.0)).toFloat() / (2f * geometry.tanHalfW)
+        assertEquals(expected, after.x, 1e-3f)
+        assertEquals(0.5f, after.y, 1e-3f)
+        // Tilting up moves it down.
+        assertTrue(SceneAnchor.toScreen(world, phone(pitchDeg = 8f), geometry)!!.y > 0.5f)
+        // Turned all the way round: behind the camera.
+        assertNull(SceneAnchor.toScreen(world, phone(yawDeg = 170f), geometry))
+    }
+
+    private fun pinnedInput(yawDeg: Float = 0f, style: PortraitStyle = PortraitStyle.SCENE) =
+        aimInput(style = style).copy(rotation = phone(yawDeg), view = geometry)
+
+    @Test
+    fun pinnedTargetSurvivesLosingTheSubject() {
+        val t = CompositionTracker()
+        val p = person(fullBody = false)
+        var r = t.run(p, pinnedInput())
+        assertEquals(AimPhase.GUIDE, r.aim.phase)
+        val before = r.aim.target!!
+        // The person drops out of detection while the phone is still: the target stays where it was.
+        for (i in 0..20) r = t.feed(2000L + i * 100, null, pinnedInput())
+        assertEquals(AimPhase.GUIDE, r.aim.phase)
+        assertEquals(before.x, r.aim.target!!.x, 1e-3f)
+        assertEquals(before.y, r.aim.target!!.y, 1e-3f)
+    }
+
+    @Test
+    fun turningThePhoneBringsThePinnedTargetIntoTheRing() {
+        val t = CompositionTracker()
+        val p = person(fullBody = false)
+        val target = t.run(p, pinnedInput()).aim.target!!
+        // Work out how far to turn so the target reaches the centre, then turn (no subject needed).
+        val yaw = Math.toDegrees(Math.atan(((target.x - 0.5f) * 2f * geometry.tanHalfW).toDouble())).toFloat()
+        val world = SceneAnchor.toWorld(target, phone(), geometry)
+        val turned = SceneAnchor.toScreen(world, phone(yawDeg = yaw), geometry)!!
+        assertEquals(0.5f, turned.x, 1e-3f)
+        var r = t.feed(3000, null, pinnedInput(yawDeg = yaw))
+        // Vertical offset is untouched by a pure turn; only check the horizontal part moved to centre.
+        assertEquals(0.5f, r.aim.target!!.x, 1e-3f)
+        assertTrue(r.aim.world != null)
+    }
+
+    @Test
+    fun cloudFramingPinnedInSpaceWithoutASubject() {
+        val t = CompositionTracker()
+        val input = pinnedInput()
+        t.run(person(fullBody = false), input)
+        val world = SceneAnchor.toWorld(Vec2(0.7f, 0.4f), phone(), geometry)
+        t.aim.setExternal(ExternalFraming(Vec2(0.6f, 0.6f), 1f, "向右一点", world = world))
+        val r = t.feed(3000, null, input)
+        assertTrue(r.aim.external)
+        assertEquals(0.7f, r.aim.target!!.x, 1e-3f)
+        assertEquals(0.4f, r.aim.target!!.y, 1e-3f)
     }
 }

@@ -16,6 +16,7 @@ import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.LumaGrid
 import com.aucai.aicamera.core.ObjectBox
 import com.aucai.aicamera.core.PortraitStyle
+import com.aucai.aicamera.core.ViewGeometry
 
 /**
  * Turns each camera frame into an upright, display-oriented bitmap (mirrored for the
@@ -25,6 +26,7 @@ import com.aucai.aicamera.core.PortraitStyle
 class FrameAnalyzer(
     private val context: Context,
     private val isSteady: () -> Boolean,
+    private val rotation: () -> FloatArray?,
     private val onResult: (frame: GuidanceFrame, width: Int, height: Int) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
@@ -34,6 +36,8 @@ class FrameAnalyzer(
     @Volatile var maxZoom = 1f
     @Volatile var style = PortraitStyle.CLOSE
     @Volatile var assistEnabled = true
+    /** Field of view at zoom 1 for the current camera and orientation. */
+    @Volatile var view: ViewGeometry? = null
 
     /** Set from any thread to drop tracking state, e.g. after switching cameras. */
     @Volatile var resetRequested = false
@@ -70,7 +74,9 @@ class FrameAnalyzer(
                 objects = emptyList()
             }
             val frameAspect = upright.width.toFloat() / upright.height
-            val aim = AimInput(frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled)
+            val aim = AimInput(
+                frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled, rotation(), view,
+            )
             val input = GuidanceInput(pose, objects, luma, aim)
             if (clearExternal) {
                 clearExternal = false

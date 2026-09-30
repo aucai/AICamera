@@ -15,6 +15,7 @@ import com.aucai.aicamera.core.AimState
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.RectN
+import com.aucai.aicamera.core.Vec2
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -36,6 +37,9 @@ class GuideOverlayView @JvmOverloads constructor(
         set(value) { field = value; invalidate() }
     var level: LevelState? = null
         set(value) { field = value; invalidate() }
+
+    /** Projects a direction in space onto the view with the latest phone orientation (null = can't). */
+    var projector: ((FloatArray) -> Vec2?)? = null
 
     /** A recommended framing that is not tied to a tracked subject (drawn as is). */
     var staticFrame: RectN? = null
@@ -131,7 +135,10 @@ class GuideOverlayView @JvmOverloads constructor(
         val aligned = aim.phase != AimPhase.GUIDE
         ringPaint.color = if (aligned) yellow else Color.WHITE
         canvas.drawCircle(cx, cy, ringRadius, ringPaint)
-        val t = aim.target ?: return
+        // Pinned in space: redraw from the live orientation, not the (slower) last analysed frame.
+        val world = aim.world
+        val live = if (world != null) projector?.invoke(world) else null
+        val t = live ?: aim.target ?: return
         val tx = image.left + t.x * image.width()
         val ty = image.top + t.y * image.height()
         // The cloud model's framing, fixed to the scene around the target.

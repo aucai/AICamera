@@ -53,7 +53,13 @@ import com.aucai.aicamera.cloud.VisionClient
 import com.aucai.aicamera.core.CloudAdvice
 import com.aucai.aicamera.core.CloudPrompts
 import com.aucai.aicamera.core.ExternalFraming
+import com.aucai.aicamera.core.SceneAnchor
 import com.aucai.aicamera.core.Vec2
+import com.aucai.aicamera.core.ViewGeometry
+import android.hardware.camera2.CameraCharacteristics
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import com.aucai.aicamera.ui.CloudSettingsDialog
 import android.content.ContentValues
 import android.graphics.ImageDecoder
@@ -143,12 +149,24 @@ class MainActivity : AppCompatActivity() {
         loadSettings()
         applyInsets()
 
-        levelSensor = LevelSensor(this) { level ->
-            analyzer.level = level
-            binding.overlay.level = level
-        }
+        levelSensor = LevelSensor(
+            this,
+            onChange = { level ->
+                analyzer.level = level
+                binding.overlay.level = level
+            },
+            // Redraw the aiming target as fast as the orientation sensor reports.
+            onRotation = { binding.overlay.invalidate() },
+        )
         levelSensor.displayRotationDeg = displayRotationDegrees()
-        analyzer = FrameAnalyzer(this, { levelSensor.isSteady }) { frame, w, h -> runOnUiThread { onFrame(frame, w, h) } }
+        analyzer = FrameAnalyzer(this, { levelSensor.isSteady }, { levelSensor.rotation() }) { frame, w, h ->
+            runOnUiThread { onFrame(frame, w, h) }
+        }
+        binding.overlay.projector = { world ->
+            val r = levelSensor.rotation()
+            val g = analyzer.view?.zoomed(analyzer.zoom)
+            if (r != null && g != null) SceneAnchor.toScreen(world, r, g) else null
+        }
         analyzer.style = style
         analyzer.assistEnabled = assistOn
 
@@ -187,6 +205,7 @@ class MainActivity : AppCompatActivity() {
         imageCapture?.targetRotation = rotation
         imageAnalysis?.targetRotation = rotation
         levelSensor.displayRotationDeg = displayRotationDegrees()
+        analyzer.view = viewForDisplay()
         analyzer.resetRequested = true
     }
 
@@ -285,6 +304,8 @@ class MainActivity : AppCompatActivity() {
             return
         }
         camera = cam
+        lensView = lensGeometry(cam)
+        analyzer.view = viewForDisplay()
         extensionActive = bound != null
         showQualityStatus()
         this.preview = preview
@@ -301,6 +322,34 @@ class MainActivity : AppCompatActivity() {
         analyzer.resetRequested = true
         lastFrame = null
         binding.overlay.clear()
+    }
+
+    /** tan(half field of view) across the long and short side of the 4:3 frame, at zoom 1. */
+    private var lensView = 0.66f to 0.5f
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun lensGeometry(cam: Camera): Pair<Float, Float> = try {
+        val info = Camera2CameraInfo.from(cam.cameraInfo)
+        val focal = info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+        val size = info.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        if (focal == null || focal <= 0f || size == null) {
+            0.66f to 0.5f
+        } else {
+            val short = min(size.width, size.height) / 2f / focal
+            // 4:3 frames: a wider sensor gets its sides cropped.
+            val long = min(maxOf(size.width, size.height) / 2f / focal, short * 4f / 3f)
+            long to short
+        }
+    } catch (e: Exception) {
+        // Roughly a typical main camera (about 67° across the long side).
+        0.66f to 0.5f
+    }
+
+    private fun viewForDisplay(): ViewGeometry {
+        val (long, short) = lensView
+        val front = lensFacing == CameraSelector.LENS_FACING_FRONT
+        val landscape = displayRotationDegrees() % 180 != 0
+        return if (landscape) ViewGeometry(long, short, front) else ViewGeometry(short, long, front)
     }
 
     private fun switchCamera() {
@@ -595,6 +644,8 @@ class MainActivity : AppCompatActivity() {
         val zoomAtShot = analyzer.zoom
         val front = lensFacing == CameraSelector.LENS_FACING_FRONT
         analyzer.snapshotListener = { image, frame ->
+            val rotationAtShot = levelSensor.rotation()?.copyOf()
+            val viewAtShot = analyzer.view?.zoomed(analyzer.zoom)
             cloudExecutor.execute {
                 val result = try {
                     val prompt = CloudPrompts.adviceRequest(image.width, image.height, contextFor(frame), front)
@@ -605,7 +656,7 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: CloudException) {
                     Result.failure(e)
                 }
-                runOnUiThread { showAdvice(result, frame, zoomAtShot) }
+                runOnUiThread { showAdvice(result, frame, zoomAtShot, rotationAtShot, viewAtShot) }
             }
         }
     }
@@ -627,7 +678,13 @@ class MainActivity : AppCompatActivity() {
         return parts.joinToString("，").ifEmpty { null }
     }
 
-    private fun showAdvice(result: Result<CloudAdvice>, frame: GuidanceFrame, zoomAtShot: Float) {
+    private fun showAdvice(
+        result: Result<CloudAdvice>,
+        frame: GuidanceFrame,
+        zoomAtShot: Float,
+        rotationAtShot: FloatArray?,
+        viewAtShot: ViewGeometry?,
+    ) {
         adviceLoading = false
         if (isDestroyed) return
         binding.adviceProgress.visibility = View.GONE
@@ -656,16 +713,21 @@ class MainActivity : AppCompatActivity() {
 
         val crop = advice.crop
         val anchor = frame.composition.frameSubject?.anchor
+        // Pin the framing to where the phone was pointing when the picture was sent, so it stays put
+        // in the scene however the phone moves afterwards.
+        val world = if (crop != null && rotationAtShot != null && viewAtShot != null) {
+            SceneAnchor.toWorld(crop.center, rotationAtShot, viewAtShot)
+        } else null
         when {
-            crop != null && anchor != null -> {
-                // Fix the framing to the subject so it follows the scene as the phone moves.
+            crop != null && (world != null || anchor != null) -> {
                 analyzer.pendingExternal = ExternalFraming(
-                    offset = Vec2(crop.center.x - anchor.x, crop.center.y - anchor.y),
                     size = Vec2(crop.width, crop.height),
                     zoomBase = zoomAtShot,
                     reason = advice.advice,
+                    world = world,
+                    offset = anchor?.let { Vec2(crop.center.x - it.x, crop.center.y - it.y) },
                 )
-                line("黄色虚线框是推荐取景：把圆点对进中间的圈", ForegroundColorSpan(secondary))
+                line("黄色虚线框是推荐取景：慢慢转动手机，把圆点对进中间的圈", ForegroundColorSpan(secondary))
             }
             crop != null -> {
                 binding.overlay.staticFrame = crop

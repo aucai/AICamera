@@ -23,6 +23,10 @@ data class AimInput(
     val style: PortraitStyle,
     val frontCamera: Boolean,
     val enabled: Boolean = true,
+    /** Phone orientation (display-aligned rotation matrix, see [SceneAnchor]); null without the sensor. */
+    val rotation: FloatArray? = null,
+    /** Field of view at zoom 1; null when unknown. */
+    val view: ViewGeometry? = null,
 )
 
 enum class AimPhase {
@@ -51,6 +55,7 @@ data class AngleGuide(val offsetDeg: Float, val text: String)
  * @property view size (normalized, at the current zoom) of the recommended framing around [target];
  *   set when the framing came from the cloud model so it can be drawn.
  * @property external the framing came from the cloud model rather than the built-in rules.
+ * @property world the target as a direction in space, so the UI can redraw it at sensor rate.
  */
 data class AimState(
     val phase: AimPhase,
@@ -61,14 +66,24 @@ data class AimState(
     val reason: String = "",
     val view: Vec2? = null,
     val external: Boolean = false,
+    val world: FloatArray? = null,
 )
 
 /**
- * A framing chosen by the cloud model, relative to the subject so it stays fixed to the scene.
- * @property offset recommended view centre minus the subject anchor, at [zoomBase].
+ * A framing chosen by the cloud model.
+ * @property world the recommended view centre as a direction in space (see [SceneAnchor]); this is
+ *   what keeps it fixed to the scene.
+ * @property offset recommended view centre minus the subject anchor at [zoomBase], when there was a
+ *   subject; used as a fallback without the orientation sensor and to correct drift.
  * @property size recommended view width/height (normalized) at [zoomBase].
  */
-data class ExternalFraming(val offset: Vec2, val size: Vec2, val zoomBase: Float, val reason: String)
+data class ExternalFraming(
+    val size: Vec2,
+    val zoomBase: Float,
+    val reason: String,
+    val world: FloatArray? = null,
+    val offset: Vec2? = null,
+)
 
 /** Recommended camera angle per kind of subject (back camera). */
 object AngleAdvisor {
@@ -107,11 +122,15 @@ class AimAssist(
     private val holdMs: Long = 400,
 ) {
     private class Recommendation(
-        val offset: Vec2,
+        /** View centre minus subject anchor at [zoomBase]; null when not tied to a subject. */
+        val offset: Vec2?,
         val zoomMul: Float,
         val zoomBase: Float,
         val reason: String,
         val size: Vec2? = null,
+        /** View centre as a direction in space; slowly corrected from the picture. */
+        var world: FloatArray? = null,
+        var offscreenSince: Long = NEVER,
     )
 
     private var rec: Recommendation? = null
@@ -135,10 +154,22 @@ class AimAssist(
             return
         }
         val zoomMul = (1f / maxOf(f.size.x, f.size.y)).coerceAtLeast(1f)
-        rec = Recommendation(f.offset, zoomMul, f.zoomBase, f.reason, f.size)
+        rec = Recommendation(f.offset, zoomMul, f.zoomBase, f.reason, f.size, f.world)
         phase = AimPhase.GUIDE
         // The model already judged the angle; do not interrupt with angle advice.
         angleDone = true
+    }
+
+    /**
+     * The tracked subject went away or changed. A recommendation pinned to a direction in space
+     * survives this (detections drop out while the phone moves); one tied to the subject does not.
+     */
+    fun subjectChanged() {
+        subjectSince = NEVER
+        if (rec?.world == null) {
+            rec = null
+            phase = AimPhase.IDLE
+        }
     }
 
     fun reset() {
@@ -151,9 +182,8 @@ class AimAssist(
     }
 
     fun update(nowMs: Long, s: FrameSubject?, input: AimInput): AimState {
-        if (s == null) reset()
-        if (!input.enabled || s == null) {
-            phase = AimPhase.IDLE
+        if (!input.enabled) {
+            reset()
             return AimState(AimPhase.IDLE)
         }
         if (style != input.style) {
@@ -161,26 +191,53 @@ class AimAssist(
             rec = null
             phase = AimPhase.IDLE
         }
-        if (subjectSince == NEVER) subjectSince = nowMs
+        val rotation = input.rotation
+        val geometry = input.view?.zoomed(input.zoom)
+        val pinned = rec?.world != null && rotation != null && geometry != null
+        if (s == null && !pinned) {
+            subjectChanged()
+            phase = AimPhase.IDLE
+            return AimState(AimPhase.IDLE)
+        }
+        if (s != null && subjectSince == NEVER) subjectSince = nowMs
 
-        // 1. Angle first: tilting changes the vertical framing, so settle it before aiming.
-        if (!hasExternal) angleState(nowMs, s, input)?.let { return it }
+        // 1. Angle first: tilting changes the vertical framing, so settle it before recommending.
+        if (rec == null && s != null) angleState(nowMs, s, input)?.let { return it }
 
         // 2. Recommend once the subject has been there a moment and the phone is still; then keep it.
         var r = rec
         if (r == null) {
-            if (nowMs - subjectSince < settleMs || !input.steady) return AimState(AimPhase.IDLE)
+            if (s == null || nowMs - subjectSince < settleMs || !input.steady) return AimState(AimPhase.IDLE)
             r = recommend(s, input)
             rec = r
             phase = AimPhase.GUIDE
         }
 
-        // The offset was measured at the zoom of the time; zooming in magnifies it.
+        // 3. Where the target is now. The offset was measured at the zoom of the time; zooming magnifies it.
         val k = input.zoom / r.zoomBase
-        val target = Vec2(s.anchor.x + r.offset.x * k, s.anchor.y + r.offset.y * k)
-        val dx = (target.x - 0.5f) * input.frameAspect
-        val dy = target.y - 0.5f
-        val error = sqrt(dx * dx + dy * dy)
+        val fromSubject = if (s != null && r.offset != null) {
+            Vec2(s.anchor.x + r.offset.x * k, s.anchor.y + r.offset.y * k)
+        } else null
+        val world = r.world
+        val target: Vec2? = if (world != null && rotation != null && geometry != null) {
+            val fromSensor = SceneAnchor.toScreen(world, rotation, geometry)
+            // Turning the phone is tracked exactly by the sensor; moving it sideways is not, so let the
+            // picture pull the target back gently while both agree roughly.
+            if (fromSensor != null && fromSubject != null && input.steady && distance(fromSensor, fromSubject, input.frameAspect) < 0.15f) {
+                r.world = SceneAnchor.blend(world, SceneAnchor.toWorld(fromSubject, rotation, geometry), 0.08f)
+            }
+            fromSensor
+        } else fromSubject
+
+        val onScreen = target != null && target.x in 0f..1f && target.y in 0f..1f
+        if (onScreen) r.offscreenSince = NEVER else if (r.offscreenSince == NEVER) r.offscreenSince = nowMs
+        // Gave up on it: pointed elsewhere for a good while.
+        if (!onScreen && nowMs - r.offscreenSince > GIVE_UP_MS) {
+            reset()
+            return AimState(AimPhase.IDLE)
+        }
+
+        val error = if (target == null) Float.MAX_VALUE else distance(target, Vec2(0.5f, 0.5f), input.frameAspect)
         val zoomGoal = (r.zoomBase * r.zoomMul).coerceAtMost(input.maxZoom)
 
         phase = when (phase) {
@@ -203,8 +260,11 @@ class AimAssist(
         }
 
         val hint = when (phase) {
-            AimPhase.GUIDE -> offscreenDirection(target)?.let { "向${it}转动手机，把圆点对进中间的圈" }
-                ?: "移动手机，把圆点对进中间的圈"
+            AimPhase.GUIDE -> when {
+                target == null -> "目标在身后，转回来找圆点"
+                else -> offscreenDirection(target)?.let { "向${it}转动手机，把圆点对进中间的圈" }
+                    ?: "慢慢转动手机，把圆点对进中间的圈"
+            }
             AimPhase.HOLD -> "对准了，保持不动"
             AimPhase.ZOOM -> "正在拉近…"
             AimPhase.DONE -> "构图完成，可以拍了"
@@ -213,6 +273,7 @@ class AimAssist(
         val view = r.size?.let { Vec2(it.x * k, it.y * k) }
         return AimState(
             phase, target, if (phase == AimPhase.ZOOM) zoomGoal else null, null, hint, r.reason, view, r.size != null,
+            r.world?.copyOf(),
         )
     }
 
@@ -267,11 +328,14 @@ class AimAssist(
         val best = FramingPlanner.candidates(s, input.frameAspect, input.frameAspect, GridMode.THIRDS, options)
             .minBy { it.cost }
         val center = best.rect.center
+        val rotation = input.rotation
+        val geometry = input.view?.zoomed(input.zoom)
         return Recommendation(
             offset = Vec2(center.x - s.anchor.x, center.y - s.anchor.y),
             zoomMul = 1f / best.config.scale,
             zoomBase = input.zoom,
             reason = FramingPlanner.reason(s, best.config),
+            world = if (rotation != null && geometry != null) SceneAnchor.toWorld(center, rotation, geometry) else null,
         )
     }
 
@@ -285,9 +349,11 @@ class AimAssist(
 
     companion object {
         /** Distances in frame heights: enter alignment, drop it, and consider the framing lost. */
-        const val ENTER = 0.035f
-        const val EXIT = 0.06f
-        const val LOST = 0.1f
+        const val ENTER = 0.05f
+        const val EXIT = 0.08f
+        const val LOST = 0.14f
+        /** Drop a recommendation whose target has been off screen this long. */
+        const val GIVE_UP_MS = 8000L
         private const val NEVER = Long.MIN_VALUE
     }
 }

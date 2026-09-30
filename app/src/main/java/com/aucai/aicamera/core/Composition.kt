@@ -350,7 +350,7 @@ class CompositionTracker(
         if (subject == null || (subjectNow != null && held != null && !sameSubject(held, subjectNow))) {
             anchor = null
             shot = null
-            aim.reset()
+            aim.subjectChanged()
         }
         this.subject = subject
         if (subject == null) {
