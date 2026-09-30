@@ -73,7 +73,7 @@
                 android:background="@drawable/bg_score"
                 android:gravity="center"
                 android:textColor="@android:color/white"
-                android:textSize="24sp"
+                android:textSize="18sp"
                 android:textStyle="bold" />
 
             <LinearLayout
@@ -101,31 +101,19 @@
             </LinearLayout>
         </LinearLayout>
 
-        <LinearLayout
+        <TextView
             android:id="@+id/pills"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginStart="-3dp"
             android:layout_marginTop="12dp"
-            android:layout_marginEnd="-3dp"
-            android:orientation="horizontal">
-
-            <TextView
-                android:id="@+id/pillComposition"
-                style="@style/ScorePill" />
-
-            <TextView
-                android:id="@+id/pillLight"
-                style="@style/ScorePill" />
-
-            <TextView
-                android:id="@+id/pillPose"
-                style="@style/ScorePill" />
-
-            <TextView
-                android:id="@+id/pillLevel"
-                style="@style/ScorePill" />
-        </LinearLayout>
+            android:background="@drawable/bg_pill"
+            android:lineSpacingExtra="2dp"
+            android:paddingStart="10dp"
+            android:paddingTop="6dp"
+            android:paddingEnd="10dp"
+            android:paddingBottom="6dp"
+            android:textColor="@android:color/white"
+            android:textSize="14sp" />
 
         <TextView
             android:id="@+id/tips"

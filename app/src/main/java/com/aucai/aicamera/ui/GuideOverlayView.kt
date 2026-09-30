@@ -15,9 +15,7 @@ import com.aucai.aicamera.core.Mode
 import com.aucai.aicamera.core.PoseIdx
 import com.aucai.aicamera.core.SubjectKind
 import kotlin.math.abs
-import kotlin.math.atan2
 import kotlin.math.cos
-import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -47,12 +45,9 @@ class GuideOverlayView @JvmOverloads constructor(
 
     private val gridPaint = stroke(Color.argb(110, 255, 255, 255), 1f)
     private val levelPaint = stroke(Color.WHITE, 2.5f).apply { strokeCap = Paint.Cap.ROUND }
-    private val targetPaint = stroke(accent, 2.5f)
-    private val arrowPaint = stroke(accent, 2.5f).apply {
-        strokeCap = Paint.Cap.ROUND
-        pathEffect = DashPathEffect(floatArrayOf(6 * dp, 5 * dp), 0f)
-    }
-    private val arrowHeadPaint = stroke(accent, 2.5f).apply { strokeCap = Paint.Cap.ROUND }
+    private val dimPaint = Paint().apply { color = Color.argb(150, 0, 0, 0) }
+    private val cropPaint = stroke(Color.WHITE, 1.2f)
+    private val cornerPaint = stroke(accent, 3.5f).apply { strokeCap = Paint.Cap.ROUND }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = accent }
     private val bonePaint = stroke(Color.WHITE, 3f).apply { strokeCap = Paint.Cap.ROUND }
     private val jointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
@@ -70,6 +65,8 @@ class GuideOverlayView @JvmOverloads constructor(
     private val histBar = Paint().apply { color = Color.argb(220, 255, 255, 255) }
 
     private val image = RectF()
+    /** The crop in view pixels; equals [image] when not cropping. */
+    private val crop = RectF()
 
     fun update(frame: GuidanceFrame, width: Int, height: Int) {
         this.frame = frame
@@ -101,14 +98,33 @@ class GuideOverlayView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         computeImageRect()
-        drawGrid(canvas)
         val f = frame
+        val r = f?.composition?.plan?.rect
+        if (r != null) crop.set(x(r.left), y(r.top), x(r.right), y(r.bottom)) else crop.set(image)
+        val cropping = r != null && (r.width < 0.999f || r.height < 0.999f)
+
         if (mode == Mode.LIGHT) f?.lighting?.let { drawLighting(canvas, it) }
-        if (mode == Mode.SMART || mode == Mode.COMPOSITION) {
-            drawLevel(canvas)
-            f?.let { drawComposition(canvas, it) }
-        }
         if (mode == Mode.POSE) f?.let { drawSkeleton(canvas, it) }
+        if (mode == Mode.SMART || mode == Mode.COMPOSITION) f?.let { drawSubject(canvas, it) }
+        if (cropping) drawCrop(canvas)
+        drawGrid(canvas)
+        if (mode == Mode.SMART || mode == Mode.COMPOSITION) drawLevel(canvas)
+    }
+
+    /** Darkens everything outside the crop, so what is left bright is the photo that will be saved. */
+    private fun drawCrop(canvas: Canvas) {
+        canvas.drawRect(image.left, image.top, image.right, crop.top, dimPaint)
+        canvas.drawRect(image.left, crop.bottom, image.right, image.bottom, dimPaint)
+        canvas.drawRect(image.left, crop.top, crop.left, crop.bottom, dimPaint)
+        canvas.drawRect(crop.right, crop.top, image.right, crop.bottom, dimPaint)
+        canvas.drawRect(crop, cropPaint)
+        val len = minOf(crop.width(), crop.height()) * 0.08f
+        for ((cx, sx) in listOf(crop.left to 1f, crop.right to -1f)) {
+            for ((cy, sy) in listOf(crop.top to 1f, crop.bottom to -1f)) {
+                canvas.drawLine(cx, cy, cx + sx * len, cy, cornerPaint)
+                canvas.drawLine(cx, cy, cx, cy + sy * len, cornerPaint)
+            }
+        }
     }
 
     private fun drawGrid(canvas: Canvas) {
@@ -118,16 +134,19 @@ class GuideOverlayView @JvmOverloads constructor(
             GridMode.CENTER -> listOf(0.5f)
             GridMode.OFF -> return
         }
+        // Lines divide the crop, i.e. the final photo, not the whole sensor frame.
         for (p in lines) {
-            canvas.drawLine(x(p), image.top, x(p), image.bottom, gridPaint)
-            canvas.drawLine(image.left, y(p), image.right, y(p), gridPaint)
+            val gx = crop.left + p * crop.width()
+            val gy = crop.top + p * crop.height()
+            canvas.drawLine(gx, crop.top, gx, crop.bottom, gridPaint)
+            canvas.drawLine(crop.left, gy, crop.right, gy, gridPaint)
         }
     }
 
     private fun drawLevel(canvas: Canvas) {
         val lv = level ?: return
-        val cx = image.centerX()
-        val cy = image.centerY()
+        val cx = crop.centerX()
+        val cy = crop.centerY()
         if (lv.flat) {
             // Bubble level: like a spirit level, the bubble drifts towards the raised edge.
             val ok = abs(lv.tiltX) < 3f && abs(lv.tiltY) < 3f
@@ -145,7 +164,7 @@ class GuideOverlayView @JvmOverloads constructor(
         levelPaint.color = if (ok) good else Color.WHITE
         // The horizon appears rotated opposite to the phone.
         val a = Math.toRadians(-lv.rollDeg.toDouble())
-        val half = image.width() * 0.18f
+        val half = crop.width() * 0.18f
         val gap = 24 * dp
         val dx = cos(a).toFloat()
         val dy = sin(a).toFloat()
@@ -156,21 +175,14 @@ class GuideOverlayView @JvmOverloads constructor(
         canvas.drawLine(cx + half + gap + 2 * dp, cy, cx + half + gap + 12 * dp, cy, gridPaint)
     }
 
-    private fun drawComposition(canvas: Canvas, f: GuidanceFrame) {
+    /** Marks what the framing is built around, so it is clear what the camera recognised. */
+    private fun drawSubject(canvas: Canvas, f: GuidanceFrame) {
         val c = f.composition
-        val anchor = c.anchor ?: return
-        val subject = c.subject
-        val color = if (c.aligned) good else accent
-        targetPaint.color = color
-        arrowPaint.color = color
-        arrowHeadPaint.color = color
-        dotPaint.color = color
-
+        val subject = c.subject ?: return
+        val anchor = c.frameSubject?.anchor ?: subject.anchor
         val ax = x(anchor.x)
         val ay = y(anchor.y)
-
-        // Show what was recognised, so it is clear what the advice is about.
-        when (subject?.kind) {
+        when (subject.kind) {
             SubjectKind.OBJECT -> subject.box?.let { b ->
                 val r = RectF(x(b.left), y(b.top), x(b.right), y(b.bottom))
                 canvas.drawRoundRect(r, 8 * dp, 8 * dp, boxPaint)
@@ -180,53 +192,7 @@ class GuideOverlayView @JvmOverloads constructor(
                 canvas.drawLine(image.left, ay, image.right, ay, horizonPaint)
                 drawLabel(canvas, subject.label, image.left + 8 * dp, ay)
             }
-            else -> Unit
-        }
-        if (subject?.kind != SubjectKind.HORIZON) canvas.drawCircle(ax, ay, 6 * dp, dotPaint)
-
-        val targetX = c.targetX
-        val targetY = c.targetY
-        if (targetX == null && targetY == null) return
-        val tx: Float
-        val ty: Float
-        when {
-            targetX != null && targetY != null -> {
-                tx = x(targetX)
-                ty = y(targetY)
-                canvas.drawCircle(tx, ty, 18 * dp, targetPaint)
-                canvas.drawCircle(tx, ty, 3 * dp, dotPaint)
-            }
-            targetX != null -> {
-                // Full-body shot: the whole vertical line is the target, fixed on screen.
-                tx = x(targetX)
-                ty = ay
-                canvas.drawLine(tx, image.top, tx, image.bottom, targetPaint)
-            }
-            else -> {
-                // Horizon: the whole horizontal line is the target.
-                tx = ax
-                ty = y(targetY!!)
-                canvas.drawLine(image.left, ty, image.right, ty, targetPaint)
-            }
-        }
-        if (c.aligned) return
-
-        // Dashed arrow from the subject towards the target.
-        val len = hypot(tx - ax, ty - ay)
-        if (len < 30 * dp) return
-        val ux = (tx - ax) / len
-        val uy = (ty - ay) / len
-        val stop = if (targetX != null && targetY != null) 22 * dp else 6 * dp
-        val sx = ax + ux * 12 * dp
-        val sy = ay + uy * 12 * dp
-        val ex = tx - ux * stop
-        val ey = ty - uy * stop
-        canvas.drawLine(sx, sy, ex, ey, arrowPaint)
-        val ang = atan2(uy, ux)
-        val head = 10 * dp
-        for (s in listOf(-1, 1)) {
-            val a = ang + Math.PI.toFloat() + s * 0.5f
-            canvas.drawLine(ex, ey, ex + cos(a) * head, ey + sin(a) * head, arrowHeadPaint)
+            SubjectKind.PERSON -> canvas.drawCircle(ax, ay, 5 * dp, dotPaint)
         }
     }
 

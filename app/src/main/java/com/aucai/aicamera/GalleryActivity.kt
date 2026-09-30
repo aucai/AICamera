@@ -25,7 +25,7 @@ import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.aucai.aicamera.databinding.ActivityGalleryBinding
 import com.aucai.aicamera.ui.ReviewStore
-import com.aucai.aicamera.ui.ScorePills
+import com.aucai.aicamera.ui.CheckText
 import com.aucai.aicamera.ui.ShutterButton
 import java.util.concurrent.Executors
 
@@ -129,22 +129,23 @@ class GalleryActivity : AppCompatActivity() {
             binding.tips.visibility = View.GONE
             return
         }
-        binding.score.text = review.total.toString()
-        binding.score.background.mutate().setTint(ShutterButton.colorFor(review.total))
-        binding.verdict.text = ScorePills.verdict(review.total)
+        val (passed, total) = CheckText.passed(review.checks)
+        binding.score.text = "$passed/$total"
+        binding.score.background.mutate().setTint(ShutterButton.colorFor(passed, total))
+        binding.verdict.text = when {
+            passed == total -> "每一项都达标"
+            passed >= total - 1 -> "差一点就完美"
+            else -> "有 ${total - passed} 项可以改进"
+        }
         binding.scene.text = "AI 识别：${review.scene}"
         binding.pills.visibility = View.VISIBLE
-        ScorePills.render(
-            this,
-            listOf(binding.pillComposition, binding.pillLight, binding.pillPose, binding.pillLevel),
-            review.items,
-        )
+        binding.pills.text = CheckText.format(this, review.checks)
         val lines = ArrayList<String>()
+        if (review.reason.isNotEmpty()) lines += "AI 取景：${review.reason}"
         if (review.blurry) lines += "照片可能有点糊，下次拿稳手机，或先点一下主体对焦"
         lines += review.tips
-        if (lines.isEmpty()) lines += "拍摄时没有发现问题"
-        binding.tips.visibility = View.VISIBLE
-        binding.tips.text = lines.take(4).joinToString("\n") { "· $it" }
+        binding.tips.visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
+        binding.tips.text = lines.take(5).joinToString("\n") { "· $it" }
     }
 
     private fun share(photo: Photo) {

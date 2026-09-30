@@ -50,7 +50,12 @@ import com.aucai.aicamera.core.GridMode
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.Mode
 import com.aucai.aicamera.core.Severity
-import com.aucai.aicamera.core.ShotScore
+import com.aucai.aicamera.core.Check
+import com.aucai.aicamera.core.CropChoice
+import com.aucai.aicamera.core.RectN
+import com.aucai.aicamera.camera.PhotoWriter
+import com.aucai.aicamera.ui.CheckText
+import androidx.camera.core.ImageProxy
 import com.aucai.aicamera.core.Tip
 import com.aucai.aicamera.core.TipAction
 import com.aucai.aicamera.core.TipCategory
@@ -59,19 +64,16 @@ import com.aucai.aicamera.databinding.ActivityMainBinding
 import com.aucai.aicamera.databinding.ViewTipBinding
 import com.aucai.aicamera.ui.PhotoReview
 import com.aucai.aicamera.ui.ReviewStore
-import com.aucai.aicamera.ui.ScorePills
 import com.aucai.aicamera.ui.Speaker
 import com.aucai.aicamera.core.Sharpness
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.extensions.ExtensionsManager
-import android.graphics.ImageDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -96,10 +98,11 @@ class MainActivity : AppCompatActivity() {
     private var voiceOn = true
 
     private var lastFrame: GuidanceFrame? = null
-    private var wasAligned = false
+    private var wasAllGood = false
     private var lastPhotoUri: Uri? = null
     private var countdownLeft = 0
-    private var smoothedScore = -1f
+    private var cropChoice = CropChoice.SAME
+    private val photoExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var extensionsManager: ExtensionsManager? = null
     private var extensionActive = false
     private var capturing = false
@@ -122,6 +125,7 @@ class MainActivity : AppCompatActivity() {
 
         analyzer = FrameAnalyzer(this) { frame, w, h -> runOnUiThread { onFrame(frame, w, h) } }
         analyzer.grid = grid
+        analyzer.crop = cropChoice
         levelSensor = LevelSensor(this) { level ->
             analyzer.level = level
             binding.overlay.level = level
@@ -149,6 +153,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         analysisExecutor.execute { analyzer.close() }
         analysisExecutor.shutdown()
+        photoExecutor.shutdown()
         speaker?.shutdown()
     }
 
@@ -159,6 +164,7 @@ class MainActivity : AppCompatActivity() {
         imageCapture?.targetRotation = rotation
         imageAnalysis?.targetRotation = rotation
         levelSensor.displayRotationDeg = displayRotationDegrees()
+        renderSettings()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -211,7 +217,10 @@ class MainActivity : AppCompatActivity() {
         preview.setSurfaceProvider(binding.previewView.surfaceProvider)
         val fullResolution = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            // ~12 MP: plenty after cropping, and a decoded frame still fits comfortably in memory.
+            .setResolutionStrategy(
+                ResolutionStrategy(Size(4000, 3000), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+            )
             .build()
         val capture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
@@ -272,7 +281,6 @@ class MainActivity : AppCompatActivity() {
             CameraSelector.LENS_FACING_BACK
         }
         analyzer.resetRequested = true
-        smoothedScore = -1f
         if (hasCameraPermission()) startCamera()
     }
 
@@ -330,29 +338,31 @@ class MainActivity : AppCompatActivity() {
         val visible = stabilizer.update(SystemClock.elapsedRealtime(), tips)
         renderTips(visible)
 
-        // Smooth the total a little so the number is readable while things move.
-        val total = frame.score.total.toFloat()
-        smoothedScore = if (smoothedScore < 0f) total else smoothedScore + 0.25f * (total - smoothedScore)
-        binding.shutter.score = smoothedScore.roundToInt()
-        renderScoreItems(frame.score)
+        val checks = checksFor(frame)
+        val passed = CheckText.passed(checks)
+        binding.shutter.checks = passed
+        binding.checkList.visibility = View.VISIBLE
+        binding.checkList.text = CheckText.format(this, checks)
         binding.sceneChip.visibility = View.VISIBLE
         binding.sceneChip.text = "AI 识别：${frame.scene}"
+        val reason = frame.composition.plan.reason
+        val showReason = reason.isNotEmpty() && (mode == Mode.SMART || mode == Mode.COMPOSITION)
+        binding.reasonChip.visibility = if (showReason) View.VISIBLE else View.GONE
+        binding.reasonChip.text = "AI 取景：$reason"
 
-        val aligned = (mode == Mode.SMART || mode == Mode.COMPOSITION) && frame.composition.aligned
-        if (aligned && !wasAligned) binding.overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        wasAligned = aligned
+        val allGood = passed.first == passed.second
+        if (allGood && !wasAllGood) binding.overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        wasAllGood = allGood
 
         if (voiceOn && countdownLeft == 0) {
             visible.firstOrNull { it.severity != Severity.INFO }?.let { speaker?.say(it.text) }
         }
     }
 
-    private fun renderScoreItems(score: ShotScore) {
-        ScorePills.render(
-            this,
-            listOf(binding.scoreComposition, binding.scoreLight, binding.scorePose, binding.scoreLevel),
-            score.items,
-        )
+    /** The frame's checks plus one the analysis thread cannot know: is the phone being held still. */
+    private fun checksFor(frame: GuidanceFrame): List<Check> {
+        val steady = levelSensor.isSteady
+        return frame.checks + Check(steady, if (steady) "手机稳定" else "手在抖")
     }
 
     private fun renderTips(tips: List<Tip>) {
@@ -452,7 +462,7 @@ class MainActivity : AppCompatActivity() {
         if (capturing) return
         capturing = true
         val frame = lastFrame
-        val subject = frame?.composition?.anchor
+        val subject = frame?.composition?.frameSubject?.anchor
         val (vx, vy) = if (subject != null) {
             binding.overlay.toView(subject.x, subject.y)
         } else {
@@ -481,47 +491,67 @@ class MainActivity : AppCompatActivity() {
         capture(frame)
     }
 
+    /**
+     * Captures at full resolution, then crops to the planned framing, turns the image upright and saves it.
+     * What gets saved is exactly the bright area shown in the viewfinder.
+     */
     private fun capture(frame: GuidanceFrame?) {
         val capture = imageCapture ?: run {
             capturing = false
             return
         }
         val fileName = "AICamera_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
-        }
-        val metadata = ImageCapture.Metadata().apply {
-            // Save selfies mirrored, exactly as they looked in the preview.
-            isReversedHorizontal = lensFacing == CameraSelector.LENS_FACING_FRONT
-        }
-        val options = ImageCapture.OutputFileOptions
-            .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            .setMetadata(metadata)
-            .build()
+        val crop = frame?.composition?.plan?.rect ?: RectN(0f, 0f, 1f, 1f)
+        val mirror = lensFacing == CameraSelector.LENS_FACING_FRONT
+        val checks = frame?.let { checksFor(it) }
 
-        // Remember what the camera thought of this shot, for the review in the gallery.
-        if (frame != null) {
+        // Remember what the camera saw and checked, for the review in the gallery.
+        if (frame != null && checks != null) {
             val tips = frame.tips.filter { it.severity != Severity.INFO }.map { it.text }.distinct()
-            reviews.put(fileName, PhotoReview(frame.score.total, frame.scene, frame.score.items, tips))
+            reviews.put(fileName, PhotoReview(frame.scene, frame.composition.plan.reason, checks, tips))
         }
 
         flash()
-        capture.takePicture(options, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                capturing = false
-                val uri = output.savedUri ?: return
-                lastPhotoUri = uri
-                showThumbnail(uri)
-                showCaptureNote(if (frame != null) "已保存 · ${frame.score.total} 分 · 点左下角看点评" else "已保存", 2500)
-                checkSharpness(uri, fileName)
+        capture.takePicture(photoExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                val saved = try {
+                    val rotation = image.imageInfo.rotationDegrees
+                    val src = image.toBitmap()
+                    image.close()
+                    val out = PhotoWriter.cropUpright(src, crop, rotation, mirror)
+                    val blurry = PhotoWriter.sharpness(out) < Sharpness.BLURRY_BELOW
+                    if (blurry) reviews.markBlurry(fileName)
+                    PhotoWriter.save(contentResolver, out, fileName)?.let { it to blurry }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "saving photo failed", t)
+                    runCatching { image.close() }
+                    null
+                }
+                runOnUiThread {
+                    capturing = false
+                    if (isDestroyed) return@runOnUiThread
+                    if (saved == null) {
+                        toast("保存照片失败")
+                        return@runOnUiThread
+                    }
+                    val (uri, blurry) = saved
+                    lastPhotoUri = uri
+                    showThumbnail(uri)
+                    val note = when {
+                        blurry -> "这张可能有点糊，拿稳再拍一张"
+                        checks != null -> "已保存 · ${checks.count { it.ok }}/${checks.size} 项达标 · 点左下角看点评"
+                        else -> "已保存"
+                    }
+                    showCaptureNote(note, 3000)
+                }
             }
 
             override fun onError(exception: ImageCaptureException) {
-                capturing = false
                 Log.e(TAG, "capture failed", exception)
-                toast("拍照失败：${exception.message}")
+                runOnUiThread {
+                    capturing = false
+                    toast("拍照失败：${exception.message}")
+                }
             }
         })
     }
@@ -539,32 +569,6 @@ class MainActivity : AppCompatActivity() {
         binding.captureNote.visibility = View.VISIBLE
         mainHandler.removeCallbacks(hideCaptureNote)
         mainHandler.postDelayed(hideCaptureNote, durationMs)
-    }
-
-    /** Warns right away when a saved photo came out blurry. */
-    private fun checkSharpness(uri: Uri, name: String) {
-        Thread {
-            val variance = try {
-                val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, info, _ ->
-                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                    val scale = 1000f / maxOf(info.size.width, info.size.height)
-                    if (scale < 1f) decoder.setTargetSize((info.size.width * scale).toInt(), (info.size.height * scale).toInt())
-                }
-                val px = IntArray(bmp.width * bmp.height)
-                bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
-                val gray = IntArray(px.size) { i ->
-                    val c = px[i]
-                    (299 * ((c shr 16) and 0xff) + 587 * ((c shr 8) and 0xff) + 114 * (c and 0xff)) / 1000
-                }
-                Sharpness.laplacianVariance(gray, bmp.width, bmp.height)
-            } catch (e: Exception) {
-                null
-            }
-            if (variance != null && variance < Sharpness.BLURRY_BELOW) {
-                reviews.markBlurry(name)
-                runOnUiThread { if (!isDestroyed) showCaptureNote("这张可能有点糊，拿稳再拍一张", 3000) }
-            }
-        }.start()
     }
 
     private fun showThumbnail(uri: Uri) {
@@ -618,6 +622,12 @@ class MainActivity : AppCompatActivity() {
         binding.btnGrid.setOnClickListener {
             grid = GridMode.entries[(grid.ordinal + 1) % GridMode.entries.size]
             analyzer.grid = grid
+            saveSettings()
+            renderSettings()
+        }
+        binding.btnCrop.setOnClickListener {
+            cropChoice = CropChoice.entries[(cropChoice.ordinal + 1) % CropChoice.entries.size]
+            analyzer.crop = cropChoice
             saveSettings()
             renderSettings()
         }
@@ -693,6 +703,9 @@ class MainActivity : AppCompatActivity() {
         binding.overlay.mode = mode
         binding.overlay.grid = grid
         binding.btnGrid.text = grid.label
+        val portrait = resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
+        binding.btnCrop.text = cropChoice.label(portrait)
+        binding.btnCrop.setTextColor(if (cropChoice == CropChoice.OFF) Color.WHITE else ContextCompat.getColor(this, R.color.accent))
         binding.btnTimer.text = if (timerSeconds == 0) "定时关" else "${timerSeconds}秒"
         binding.btnVoice.text = if (voiceOn) "语音开" else "语音关"
         binding.btnVoice.setCompoundDrawablesRelativeWithIntrinsicBounds(
@@ -729,6 +742,7 @@ class MainActivity : AppCompatActivity() {
         grid = GridMode.entries.getOrNull(prefs.getInt("grid", 0)) ?: GridMode.THIRDS
         timerSeconds = prefs.getInt("timer", 0)
         voiceOn = prefs.getBoolean("voice", true)
+        cropChoice = CropChoice.entries.getOrNull(prefs.getInt("crop", 0)) ?: CropChoice.SAME
     }
 
     private fun saveSettings() {
@@ -737,6 +751,7 @@ class MainActivity : AppCompatActivity() {
             .putInt("grid", grid.ordinal)
             .putInt("timer", timerSeconds)
             .putBoolean("voice", voiceOn)
+            .putInt("crop", cropChoice.ordinal)
             .apply()
     }
 

@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import com.aucai.aicamera.core.CropChoice
 import com.aucai.aicamera.core.GridMode
 import com.aucai.aicamera.core.GuidanceEngine
 import com.aucai.aicamera.core.GuidanceFrame
@@ -28,6 +29,8 @@ class FrameAnalyzer(
     @Volatile var frontCamera = false
     @Volatile var level: LevelState? = null
     @Volatile var grid = GridMode.THIRDS
+    /** How photos are auto-cropped. */
+    @Volatile var crop = CropChoice.SAME
 
     /** Set from any thread to drop tracking state, e.g. after switching cameras. */
     @Volatile var resetRequested = false
@@ -56,7 +59,9 @@ class FrameAnalyzer(
                 engine.reset()
                 objects = emptyList()
             }
-            val frame = engine.analyze(now, GuidanceInput(pose, objects, luma, level, grid))
+            val frameAspect = upright.width.toFloat() / upright.height
+            val input = GuidanceInput(pose, objects, luma, level, grid, frameAspect, crop.aspect(frameAspect))
+            val frame = engine.analyze(now, input)
             onResult(frame, upright.width, upright.height)
         } catch (t: Throwable) {
             Log.e(TAG, "analysis failed", t)

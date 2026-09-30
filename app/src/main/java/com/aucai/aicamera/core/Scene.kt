@@ -73,12 +73,22 @@ object Coco {
 
 object SubjectPicker {
 
-    /** Person first, then the most prominent object, then a horizon. */
-    fun pick(pose: PoseFrame?, objects: List<ObjectBox>, luma: LumaGrid?): Subject? {
+    /**
+     * Person first, then the most prominent object, then a horizon. An object overlapping [previous]
+     * is kept while it is still reasonably prominent, so the subject does not flip between similar things.
+     */
+    fun pick(pose: PoseFrame?, objects: List<ObjectBox>, luma: LumaGrid?, previous: Subject? = null): Subject? {
         if (pose != null && pose.hasShoulders) {
             return Subject(SubjectKind.PERSON, "人物", pose.eyes, pose.bodyBounds())
         }
-        bestObject(objects)?.let { o ->
+        val candidates = objects.filter { Coco.canBeSubject(it.label) && it.box.width * it.box.height >= 0.01f }
+        val best = candidates.maxByOrNull { weight(it) }
+        val prevBox = previous?.takeIf { it.kind == SubjectKind.OBJECT }?.box
+        val kept = prevBox?.let { pb ->
+            candidates.filter { iou(it.box, pb) > 0.3f }.maxByOrNull { weight(it) }
+                ?.takeIf { best == null || weight(it) >= 0.7f * weight(best) }
+        }
+        (kept ?: best)?.let { o ->
             return Subject(SubjectKind.OBJECT, Coco.zh(o.label), o.box.center, o.box, Coco.group(o.label))
         }
         luma?.let { HorizonDetector.detect(it) }?.let { y ->
@@ -88,17 +98,17 @@ object SubjectPicker {
     }
 
     fun bestObject(objects: List<ObjectBox>): ObjectBox? =
-        objects
-            .filter { Coco.canBeSubject(it.label) && it.box.width * it.box.height >= 0.01f }
-            .maxByOrNull { o ->
-                val weight = when (Coco.group(o.label)) {
-                    ObjectGroup.PET -> 1.3f
-                    ObjectGroup.FOOD -> 1.2f
-                    ObjectGroup.PLANT -> 1.0f
-                    ObjectGroup.THING -> 0.9f
-                }
-                weight * o.score * sqrt(o.box.width * o.box.height)
-            }
+        objects.filter { Coco.canBeSubject(it.label) && it.box.width * it.box.height >= 0.01f }.maxByOrNull { weight(it) }
+
+    private fun weight(o: ObjectBox): Float {
+        val w = when (Coco.group(o.label)) {
+            ObjectGroup.PET -> 1.3f
+            ObjectGroup.FOOD -> 1.2f
+            ObjectGroup.PLANT -> 1.0f
+            ObjectGroup.THING -> 0.9f
+        }
+        return w * o.score * sqrt(o.box.width * o.box.height)
+    }
 }
 
 /**

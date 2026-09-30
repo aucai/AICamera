@@ -9,18 +9,18 @@ import android.util.AttributeSet
 import android.view.View
 import kotlin.math.min
 
-/** Shutter button whose outer ring shows the live shot score (red → yellow → green). */
+/** Shutter button whose outer ring shows how many checks the shot passes (e.g. 4/5). */
 class ShutterButton @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
 ) : View(context, attrs) {
 
-    /** 0..100, or null when there is nothing to score yet. */
-    var score: Int? = null
+    /** Passed / total checks, or null before the first analysis. */
+    var checks: Pair<Int, Int>? = null
         set(value) {
             if (field != value) {
                 field = value
-                contentDescription = if (value == null) "拍照" else "拍照，当前评分$value"
+                contentDescription = if (value == null) "拍照" else "拍照，${value.first}/${value.second} 项达标"
                 invalidate()
             }
         }
@@ -56,16 +56,16 @@ class ShutterButton @JvmOverloads constructor(
         val r = min(width, height) / 2f - ring.strokeWidth
         arc.set(cx - r, cy - r, cx + r, cy + r)
         canvas.drawCircle(cx, cy, r, track)
-        val s = score
-        if (s != null) {
-            ring.color = colorFor(s)
-            canvas.drawArc(arc, -90f, 360f * s / 100f, false, ring)
+        val c = checks
+        if (c != null && c.second > 0) {
+            ring.color = colorFor(c.first, c.second)
+            canvas.drawArc(arc, -90f, 360f * c.first / c.second, false, ring)
         }
         val ir = r - 9 * dp
         canvas.drawCircle(cx, cy, if (isPressed) ir * 0.92f else ir, inner)
-        if (s != null) {
-            text.textSize = ir * 0.62f
-            canvas.drawText(s.toString(), cx, cy - (text.ascent() + text.descent()) / 2f, text)
+        if (c != null && c.second > 0) {
+            text.textSize = ir * 0.5f
+            canvas.drawText("${c.first}/${c.second}", cx, cy - (text.ascent() + text.descent()) / 2f, text)
         }
     }
 
@@ -75,9 +75,9 @@ class ShutterButton @JvmOverloads constructor(
     }
 
     companion object {
-        fun colorFor(score: Int): Int = when {
-            score >= 80 -> Color.parseColor("#34C77B")
-            score >= 60 -> Color.parseColor("#FFC940")
+        fun colorFor(passed: Int, total: Int): Int = when {
+            passed >= total -> Color.parseColor("#34C77B")
+            passed >= total - 1 -> Color.parseColor("#FFC940")
             else -> Color.parseColor("#FF5A4E")
         }
     }

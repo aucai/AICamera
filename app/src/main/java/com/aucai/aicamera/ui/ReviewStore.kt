@@ -1,17 +1,17 @@
 package com.aucai.aicamera.ui
 
 import android.content.Context
-import com.aucai.aicamera.core.ScoreItem
-import com.aucai.aicamera.core.TipCategory
+import com.aucai.aicamera.core.Check
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/** What the camera thought of a photo when it was taken. */
+/** What the camera saw and checked when a photo was taken. */
 data class PhotoReview(
-    val total: Int,
     val scene: String,
-    val items: List<ScoreItem>,
+    /** Why the camera framed the photo the way it did; empty when it was not cropped. */
+    val reason: String,
+    val checks: List<Check>,
     val tips: List<String>,
     val blurry: Boolean = false,
 )
@@ -59,26 +59,22 @@ class ReviewStore(context: Context) {
     }
 
     private fun encode(r: PhotoReview) = JSONObject().apply {
-        put("total", r.total)
         put("scene", r.scene)
+        put("reason", r.reason)
         put("blurry", r.blurry)
-        put("items", JSONArray().apply {
-            r.items.forEach {
-                put(JSONObject().put("c", it.category.name).put("p", it.points).put("m", it.max).put("n", it.note))
-            }
-        })
+        put("checks", JSONArray().apply { r.checks.forEach { put(JSONObject().put("ok", it.ok).put("t", it.text)) } })
         put("tips", JSONArray(r.tips))
     }
 
     private fun decode(o: JSONObject): PhotoReview? = try {
-        val items = o.getJSONArray("items")
+        val checks = o.getJSONArray("checks")
         val tips = o.getJSONArray("tips")
         PhotoReview(
-            total = o.getInt("total"),
             scene = o.optString("scene"),
-            items = (0 until items.length()).map {
-                val i = items.getJSONObject(it)
-                ScoreItem(TipCategory.valueOf(i.getString("c")), i.getInt("p"), i.getInt("m"), i.getString("n"))
+            reason = o.optString("reason"),
+            checks = (0 until checks.length()).map {
+                val c = checks.getJSONObject(it)
+                Check(c.getBoolean("ok"), c.getString("t"))
             },
             tips = (0 until tips.length()).map { tips.getString(it) },
             blurry = o.optBoolean("blurry"),
