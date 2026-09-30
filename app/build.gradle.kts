@@ -70,6 +70,7 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.12.4")
     implementation("com.google.android.material:material:1.13.0")
     implementation("androidx.viewpager2:viewpager2:1.1.0")
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
 
     testImplementation("junit:junit:4.13.2")
     // Real org.json for unit tests (the Android one is only a stub on the JVM).

@@ -52,6 +52,8 @@ data class LightingResult(
     val backlit: Boolean,
     val splitLight: Boolean,
     val tips: List<Tip>,
+    /** [subjectLuma] was measured on the face (not the body, whose clothes may be any colour). */
+    val subjectIsFace: Boolean = false,
 )
 
 object LightingAnalyzer {
@@ -143,7 +145,7 @@ object LightingAnalyzer {
 
         return LightingResult(
             mean, hist, clipped, grid.width, grid.height, subject?.center,
-            highRatio, lowRatio, subjectLuma, backlit, splitLight, tips,
+            highRatio, lowRatio, subjectLuma, backlit, splitLight, tips, subject != null && subject === face,
         )
     }
 }

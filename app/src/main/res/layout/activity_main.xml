@@ -10,6 +10,7 @@
         android:id="@+id/previewView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        app:implementationMode="compatible"
         app:scaleType="fitCenter" />
 
     <com.aucai.aicamera.ui.GuideOverlayView
@@ -72,6 +73,11 @@
                 app:drawableTopCompat="@drawable/ic_voice_off" />
 
             <TextView
+                android:id="@+id/btnEnhance"
+                style="@style/ToolButton"
+                app:drawableTopCompat="@drawable/ic_magic" />
+
+            <TextView
                 android:id="@+id/btnAi"
                 style="@style/ToolButton"
                 android:text="@string/ai_advice"
@@ -94,6 +100,12 @@
                 android:id="@+id/qualityChip"
                 style="@style/SmallChip"
                 android:layout_marginEnd="6dp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/filterChip"
+                style="@style/SmallChip"
+                android:layout_marginStart="6dp"
                 android:visibility="gone" />
 
             <TextView
@@ -258,6 +270,12 @@
                 android:src="@drawable/ic_switch_camera" />
         </FrameLayout>
     </LinearLayout>
+
+    <!-- Lights up the whole screen as a front-camera flash. -->
+    <androidx.camera.view.ScreenFlashView
+        android:id="@+id/screenFlash"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
 
     <LinearLayout
         android:id="@+id/permissionPanel"

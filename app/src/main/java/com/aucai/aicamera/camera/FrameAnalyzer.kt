@@ -36,6 +36,10 @@ class FrameAnalyzer(
     @Volatile var maxZoom = 1f
     @Volatile var style = PortraitStyle.CLOSE
     @Volatile var assistEnabled = true
+    /** Automatic crop, light and colour once the shot is framed. */
+    @Volatile var enhance = true
+    /** The camera can light the subject (a flash unit, or the screen for selfies). */
+    @Volatile var hasFlash = false
     /** Field of view at zoom 1 for the current camera and orientation. */
     @Volatile var view: ViewGeometry? = null
 
@@ -77,7 +81,7 @@ class FrameAnalyzer(
             val aim = AimInput(
                 frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled, rotation(), view,
             )
-            val input = GuidanceInput(pose, objects, luma, aim)
+            val input = GuidanceInput(pose, objects, luma, aim, enhance, hasFlash)
             if (clearExternal) {
                 clearExternal = false
                 engine.setExternal(null)

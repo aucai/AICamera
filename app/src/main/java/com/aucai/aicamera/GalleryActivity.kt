@@ -162,6 +162,7 @@ class GalleryActivity : AppCompatActivity() {
         val lines = ArrayList<String>()
         review.ai?.let { lines += aiLines(it) }
         if (review.reason.isNotEmpty()) lines += "取景：${review.reason}"
+        if (review.edits.isNotEmpty()) lines += "自动处理：${review.edits}"
         if (review.blurry) lines += "照片可能有点糊，下次拿稳手机，或先点一下主体对焦"
         lines += review.tips
         binding.tips.visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE

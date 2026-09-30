@@ -17,6 +17,8 @@ data class PhotoReview(
     val blurry: Boolean = false,
     /** The cloud model's review, once asked for in the gallery. */
     val ai: CloudReview? = null,
+    /** What the camera did to the photo automatically, e.g. "裁成 1:1、美味滤镜"; empty = untouched. */
+    val edits: String = "",
 )
 
 /** Keeps a review per photo (keyed by file name) in a small JSON file in app storage. */
@@ -74,6 +76,7 @@ class ReviewStore(context: Context) {
         put("scene", r.scene)
         put("reason", r.reason)
         put("blurry", r.blurry)
+        put("edits", r.edits)
         put("checks", JSONArray().apply { r.checks.forEach { put(JSONObject().put("ok", it.ok).put("t", it.text)) } })
         put("tips", JSONArray(r.tips))
     }
@@ -91,6 +94,7 @@ class ReviewStore(context: Context) {
             tips = (0 until tips.length()).map { tips.getString(it) },
             blurry = o.optBoolean("blurry"),
             ai = o.optJSONObject("ai")?.let { CloudReview(it.optString("good"), it.optString("improve"), it.optString("next")) },
+            edits = o.optString("edits"),
         )
     } catch (e: Exception) {
         null

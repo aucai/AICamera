@@ -8,6 +8,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -47,10 +49,15 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.aucai.aicamera.camera.FrameAnalyzer
+import com.aucai.aicamera.camera.PhotoEdits
+import com.aucai.aicamera.camera.PhotoProcessor
 import com.aucai.aicamera.cloud.CloudException
 import com.aucai.aicamera.cloud.CloudSettings
 import com.aucai.aicamera.cloud.VisionClient
 import com.aucai.aicamera.core.CloudAdvice
+import com.aucai.aicamera.core.ColorMatrices
+import com.aucai.aicamera.core.ExposureAssist
+import com.aucai.aicamera.core.Filter
 import com.aucai.aicamera.core.CloudPrompts
 import com.aucai.aicamera.core.ExternalFraming
 import com.aucai.aicamera.core.SceneAnchor
@@ -79,6 +86,7 @@ import com.aucai.aicamera.databinding.ActivityMainBinding
 import com.aucai.aicamera.ui.PhotoReview
 import com.aucai.aicamera.ui.ReviewStore
 import com.aucai.aicamera.ui.Speaker
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -117,6 +125,9 @@ class MainActivity : AppCompatActivity() {
     private var timerSeconds = 0
     private var voiceOn = false
     private var style = PortraitStyle.CLOSE
+    private var enhanceOn = true
+    /** A filter the user picked; null = choose one for the scene once framed. */
+    private var filterChoice: Filter? = null
 
     // Live state
     private var lastFrame: GuidanceFrame? = null
@@ -133,6 +144,11 @@ class MainActivity : AppCompatActivity() {
     private var faceMeterY = -1f
     private var adviceLoading = false
     private var extensionActive = false
+    private val exposureAssist = ExposureAssist()
+    private var previewFilter = Filter.NONE
+    private var previewMatrix = ColorMatrices.IDENTITY
+    private var filterAnimator: ValueAnimator? = null
+    private val layerPaint = Paint()
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -169,6 +185,9 @@ class MainActivity : AppCompatActivity() {
         }
         analyzer.style = style
         analyzer.assistEnabled = assistOn
+        analyzer.enhance = enhanceOn
+        // Selfie fill light: the screen turns white and bright while the photo is taken.
+        binding.screenFlash.setScreenFlashWindow(window)
 
         setupControls()
         renderSettings()
@@ -191,6 +210,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         zoomAnimator?.cancel()
+        filterAnimator?.cancel()
         analysisExecutor.execute { analyzer.close() }
         analysisExecutor.shutdown()
         photoExecutor.shutdown()
@@ -267,6 +287,11 @@ class MainActivity : AppCompatActivity() {
             .setResolutionSelector(fullResolution)
             .setTargetRotation(rotation)
             .build()
+        try {
+            capture.screenFlash = binding.screenFlash.screenFlash
+        } catch (e: Exception) {
+            Log.w(TAG, "screen flash unavailable", e)
+        }
         val analysis = ImageAnalysis.Builder()
             .setResolutionSelector(analysisSize)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -304,6 +329,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
         camera = cam
+        analyzer.hasFlash = lensFacing == CameraSelector.LENS_FACING_FRONT || cam.cameraInfo.hasFlashUnit()
+        exposureAssist.reset()
+        if (cam.cameraInfo.exposureState.isExposureCompensationSupported) {
+            cam.cameraControl.setExposureCompensationIndex(0)
+        }
         lensView = lensGeometry(cam)
         analyzer.view = viewForDisplay()
         extensionActive = bound != null
@@ -405,12 +435,13 @@ class MainActivity : AppCompatActivity() {
         binding.shutter.ready = aim.phase == AimPhase.DONE
 
         autoMeterOnFace(frame, now)
+        updateExposure(frame, now)
+        showPreviewFilter(effectiveFilter(frame))
 
         // Scene label, short like a phone maker's "AI" badge.
         binding.sceneChip.visibility = if (subject != null) View.VISIBLE else View.GONE
         binding.sceneChip.text = frame.scene.substringBefore(" · ")
-        binding.lightBadge.visibility =
-            if (frame.lighting?.backlit == true && subject?.kind == SubjectKind.PERSON) View.VISIBLE else View.GONE
+        renderLookChips(frame)
 
         val showStyles = assistOn && subject?.kind == SubjectKind.PERSON
         binding.styleChips.visibility = if (showStyles) View.VISIBLE else View.INVISIBLE
@@ -433,9 +464,107 @@ class MainActivity : AppCompatActivity() {
         if (!assistOn) return lightTip ?: ""
         return when (aim.phase) {
             AimPhase.IDLE -> lightTip ?: if (frame.composition.subject == null) "对准想拍的人或物" else ""
-            AimPhase.DONE -> if (now - doneSince < 1500) aim.hint else poseTip ?: lightTip ?: aim.hint
+            AimPhase.DONE -> if (now - doneSince < 1500) doneHint(frame) else poseTip ?: lightTip ?: doneHint(frame)
             else -> aim.hint
         }
+    }
+
+    /** "Framed", plus what the camera did about it. */
+    private fun doneHint(frame: GuidanceFrame): String {
+        val look = frame.look
+        if (!look.engaged) return frame.composition.aim.hint
+        val parts = ArrayList<String>()
+        look.crop?.let { parts += "裁成 ${it.label}" }
+        val filter = effectiveFilter(frame)
+        if (filter != Filter.NONE) parts += "${filter.label}滤镜"
+        if (parts.isEmpty()) return frame.composition.aim.hint
+        return "构图完成（${parts.joinToString("、")}），可以拍了"
+    }
+
+    // ------------------------------------------------------------ auto look
+
+    /** The user's filter, or once framed the one that suits the scene. */
+    private fun effectiveFilter(frame: GuidanceFrame?): Filter =
+        filterChoice ?: if (frame != null && enhanceOn && frame.look.engaged) frame.look.filter else Filter.NONE
+
+    /** Once framed, brightens or darkens a third of a stop at a time until the subject is well exposed. */
+    private fun updateExposure(frame: GuidanceFrame, now: Long) {
+        val cam = camera ?: return
+        // Leave exposure alone while taking a photo, and for a while after the user tapped to meter.
+        if (capturing || now - manualFocusAt < 5000) return
+        val state = cam.cameraInfo.exposureState
+        if (!state.isExposureCompensationSupported) return
+        val range = state.exposureCompensationRange
+        val active = enhanceOn && frame.look.engaged
+        exposureAssist.update(now, frame.look.exposure, active, range.lower..range.upper, state.exposureCompensationStep.toFloat())
+            ?.let { cam.cameraControl.setExposureCompensationIndex(it) }
+    }
+
+    private fun currentEv(): Float {
+        val state = camera?.cameraInfo?.exposureState ?: return 0f
+        if (!state.isExposureCompensationSupported) return 0f
+        return state.exposureCompensationIndex * state.exposureCompensationStep.toFloat()
+    }
+
+    /** What the camera is doing about the light right now, e.g. "闪光补光 · 提亮 +0.7EV". */
+    private fun lightActions(frame: GuidanceFrame): List<String> {
+        val look = frame.look
+        if (!look.engaged) return emptyList()
+        val out = ArrayList<String>()
+        if (look.flash && analyzer.hasFlash) out += if (lensFacing == CameraSelector.LENS_FACING_FRONT) "屏幕补光" else "闪光补光"
+        val ev = currentEv()
+        if (abs(ev) >= 0.1f) out += "%s %+.1fEV".format(if (ev > 0) "提亮" else "压暗", ev)
+        if (look.softFill >= 0.1f) out += "暗部补光"
+        return out
+    }
+
+    private fun renderLookChips(frame: GuidanceFrame?) {
+        val filter = effectiveFilter(frame)
+        binding.filterChip.visibility = View.VISIBLE
+        binding.filterChip.text = when {
+            filterChoice != null -> "滤镜 · ${filter.label}"
+            filter != Filter.NONE -> "滤镜 · ${filter.label}（自动）"
+            else -> "滤镜 · 自动"
+        }
+        val light = frame?.let { lightActions(it) } ?: emptyList()
+        val backlit = frame?.lighting?.backlit == true && frame.composition.subject?.kind == SubjectKind.PERSON
+        binding.lightBadge.visibility = if (light.isNotEmpty() || backlit) View.VISIBLE else View.GONE
+        binding.lightBadge.text = if (light.isNotEmpty()) light.joinToString(" · ") else getString(R.string.backlight_fix)
+    }
+
+    /** Tap the filter chip: automatic, then each filter in turn. */
+    private fun nextFilter() {
+        val order = listOf<Filter?>(null) + Filter.entries
+        filterChoice = order[(order.indexOf(filterChoice) + 1) % order.size]
+        saveSettings()
+        showPreviewFilter(effectiveFilter(lastFrame))
+        renderLookChips(lastFrame)
+    }
+
+    /** Shows the filter on the live preview, fading between looks. */
+    private fun showPreviewFilter(f: Filter) {
+        if (f == previewFilter) return
+        previewFilter = f
+        val from = previewMatrix
+        val to = ColorMatrices.forFilter(f)
+        filterAnimator?.cancel()
+        filterAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 300
+            addUpdateListener { setPreviewMatrix(ColorMatrices.lerp(from, to, it.animatedValue as Float)) }
+            start()
+        }
+    }
+
+    /** The preview is a TextureView, so a colour filter on its layer recolours the live picture. */
+    private fun setPreviewMatrix(m: FloatArray) {
+        previewMatrix = m
+        val pv = binding.previewView
+        if (m.contentEquals(ColorMatrices.IDENTITY)) {
+            if (pv.layerType != View.LAYER_TYPE_NONE) pv.setLayerType(View.LAYER_TYPE_NONE, null)
+            return
+        }
+        layerPaint.colorFilter = ColorMatrixColorFilter(m)
+        if (pv.layerType != View.LAYER_TYPE_HARDWARE) pv.setLayerType(View.LAYER_TYPE_HARDWARE, layerPaint) else pv.setLayerPaint(layerPaint)
     }
 
     private fun showHint(text: String) {
@@ -548,15 +677,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Saves the camera's own JPEG straight to the gallery (no decoding and re-compressing, so no quality
-     * is lost), then checks a small copy for blur.
+     * Without edits, saves the camera's own JPEG straight to the gallery (no re-compressing). Once
+     * framed, the photo is cropped, lit and coloured the way the preview showed it. Either way a small
+     * copy is then checked for blur.
      */
-    private fun capture(frame: GuidanceFrame?) {
+    private fun capture(pressed: GuidanceFrame?) {
         val capture = imageCapture ?: run {
             capturing = false
             return
         }
         val fileName = "AICamera_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
+        val front = lensFacing == CameraSelector.LENS_FACING_FRONT
+
+        // The latest framing, if the shot is still framed; otherwise what was on screen at the press.
+        val frame = lastFrame?.takeIf { it.look.engaged } ?: pressed
+        val look = frame?.look?.takeIf { it.engaged && enhanceOn }
+        val edits = PhotoEdits(look?.crop?.rect, effectiveFilter(frame), look?.softFill ?: 0f)
+        val flash = look?.flash == true && analyzer.hasFlash
+        setFlash(capture, flash, front)
+        val editText = describeEdits(edits, look?.crop?.label, flash, front)
 
         // Remember what the camera saw, for the review in the gallery.
         if (frame != null) {
@@ -566,46 +705,133 @@ class MainActivity : AppCompatActivity() {
                 .map { it.text }
                 .distinct()
             val reason = if (aim.phase == AimPhase.DONE) aim.reason else ""
-            reviews.put(fileName, PhotoReview(frame.scene, reason, frame.checks, tips))
+            reviews.put(fileName, PhotoReview(frame.scene, reason, frame.checks, tips, edits = editText))
         }
 
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
-        }
         val metadata = ImageCapture.Metadata().apply {
             // Save selfies mirrored, exactly as they looked in the preview.
-            isReversedHorizontal = lensFacing == CameraSelector.LENS_FACING_FRONT
+            isReversedHorizontal = front
         }
-        val options = ImageCapture.OutputFileOptions
-            .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            .setMetadata(metadata)
-            .build()
+        val raw = File(cacheDir, "capture_$fileName")
+        val options = if (edits.isEmpty) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+            }
+            ImageCapture.OutputFileOptions
+                .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                .setMetadata(metadata)
+                .build()
+        } else {
+            ImageCapture.OutputFileOptions.Builder(raw).setMetadata(metadata).build()
+        }
 
-        flash()
+        if (!flash || !front) flash()
         capture.takePicture(options, photoExecutor, object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                val uri = output.savedUri
+                // The picture is taken; editing it need not hold up the next one.
+                if (!edits.isEmpty) runOnUiThread { capturing = false }
+                val uri = if (edits.isEmpty) output.savedUri else saveEdited(raw, fileName, edits)
                 val blurry = uri != null && isBlurry(uri)
                 if (blurry) reviews.markBlurry(fileName)
                 runOnUiThread {
-                    capturing = false
-                    if (isDestroyed || uri == null) return@runOnUiThread
+                    // (Edited photos released the shutter already; a newer capture may be under way.)
+                    if (edits.isEmpty) capturing = false
+                    if (isDestroyed) return@runOnUiThread
+                    if (uri == null) {
+                        toast("保存照片失败")
+                        return@runOnUiThread
+                    }
                     lastPhotoUri = uri
                     showThumbnail(uri)
-                    showCaptureNote(if (blurry) "这张可能有点糊，拿稳再拍一张" else "已保存，点左下角看点评", 2500)
+                    val note = when {
+                        blurry -> "这张可能有点糊，拿稳再拍一张"
+                        editText.isNotEmpty() -> "已保存（$editText）"
+                        else -> "已保存，点左下角看点评"
+                    }
+                    showCaptureNote(note, 2500)
                 }
             }
 
             override fun onError(exception: ImageCaptureException) {
                 Log.e(TAG, "capture failed", exception)
+                raw.delete()
                 runOnUiThread {
                     capturing = false
                     toast("拍照失败：${exception.message}")
                 }
             }
         })
+    }
+
+    /** Flash as fill light: the flash unit, or the screen for selfies. Off otherwise. */
+    private fun setFlash(capture: ImageCapture, on: Boolean, front: Boolean) {
+        val mode = when {
+            !on -> ImageCapture.FLASH_MODE_OFF
+            front -> ImageCapture.FLASH_MODE_SCREEN
+            else -> ImageCapture.FLASH_MODE_ON
+        }
+        try {
+            capture.flashMode = mode
+        } catch (e: Exception) {
+            Log.w(TAG, "flash mode $mode not supported", e)
+            runCatching { capture.flashMode = ImageCapture.FLASH_MODE_OFF }
+        }
+    }
+
+    private fun describeEdits(edits: PhotoEdits, cropLabel: String?, flash: Boolean, front: Boolean): String {
+        val parts = ArrayList<String>()
+        if (edits.crop != null && cropLabel != null) parts += "裁成 $cropLabel"
+        if (edits.filter != Filter.NONE) parts += "${edits.filter.label}滤镜"
+        if (flash) parts += if (front) "屏幕补光" else "闪光补光"
+        val ev = currentEv()
+        if (abs(ev) >= 0.1f) parts += "%s %+.1fEV".format(if (ev > 0) "提亮" else "压暗", ev)
+        if (edits.fill >= 0.1f) parts += "暗部补光"
+        return parts.joinToString("、")
+    }
+
+    /**
+     * Applies the edits to the camera's JPEG and adds the result to the gallery. If editing fails
+     * (e.g. not enough memory), the untouched photo is saved instead, so nothing is lost.
+     */
+    private fun saveEdited(raw: File, fileName: String, edits: PhotoEdits): Uri? {
+        val edited = File(cacheDir, "edited_$fileName")
+        try {
+            val source = try {
+                PhotoProcessor.process(raw, edited, edits)
+                edited
+            } catch (t: Throwable) {
+                Log.e(TAG, "editing failed, saving the original", t)
+                raw
+            }
+            return insertJpeg(source, fileName)
+        } catch (e: Exception) {
+            Log.e(TAG, "saving failed", e)
+            return null
+        } finally {
+            raw.delete()
+            edited.delete()
+        }
+    }
+
+    private fun insertJpeg(file: File, fileName: String): Uri? {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        try {
+            val out = contentResolver.openOutputStream(uri) ?: error("cannot write to the gallery")
+            out.use { o -> file.inputStream().use { it.copyTo(o) } }
+            contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            return uri
+        } catch (e: Exception) {
+            runCatching { contentResolver.delete(uri, null, null) }
+            throw e
+        }
     }
 
     private fun isBlurry(uri: Uri): Boolean = try {
@@ -840,6 +1066,14 @@ class MainActivity : AppCompatActivity() {
                 }, 1500)
             }
         }
+        binding.btnEnhance.setOnClickListener {
+            enhanceOn = !enhanceOn
+            analyzer.enhance = enhanceOn
+            saveSettings()
+            renderSettings()
+            toast(if (enhanceOn) "对准后自动裁剪、调光补光、加滤镜" else "已关闭自动美化，照片保持原样")
+        }
+        binding.filterChip.setOnClickListener { nextFilter() }
         binding.btnAi.setOnClickListener { requestAdvice() }
         binding.btnAi.setOnLongClickListener {
             CloudSettingsDialog.show(this)
@@ -894,6 +1128,8 @@ class MainActivity : AppCompatActivity() {
         binding.btnTimer.setTextColor(if (timerSeconds == 0) Color.WHITE else accent)
         binding.btnVoice.text = if (voiceOn) "语音开" else "语音关"
         binding.btnVoice.setTextColor(if (voiceOn) accent else Color.WHITE)
+        binding.btnEnhance.text = if (enhanceOn) "美化开" else "美化关"
+        binding.btnEnhance.setTextColor(if (enhanceOn) accent else Color.WHITE)
         binding.btnVoice.setCompoundDrawablesRelativeWithIntrinsicBounds(
             0, if (voiceOn) R.drawable.ic_voice_on else R.drawable.ic_voice_off, 0, 0
         )
@@ -913,6 +1149,8 @@ class MainActivity : AppCompatActivity() {
         timerSeconds = prefs.getInt("timer", 0)
         voiceOn = prefs.getBoolean("voice2", false)
         style = PortraitStyle.entries.getOrNull(prefs.getInt("style", 0)) ?: PortraitStyle.CLOSE
+        enhanceOn = prefs.getBoolean("enhance", true)
+        filterChoice = Filter.entries.getOrNull(prefs.getInt("filter", -1))
     }
 
     private fun saveSettings() {
@@ -922,6 +1160,8 @@ class MainActivity : AppCompatActivity() {
             .putInt("timer", timerSeconds)
             .putBoolean("voice2", voiceOn)
             .putInt("style", style.ordinal)
+            .putBoolean("enhance", enhanceOn)
+            .putInt("filter", filterChoice?.ordinal ?: -1)
             .apply()
     }
 

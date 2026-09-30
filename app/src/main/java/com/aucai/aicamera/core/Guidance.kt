@@ -5,6 +5,10 @@ class GuidanceInput(
     val objects: List<ObjectBox>,
     val luma: LumaGrid?,
     val aim: AimInput,
+    /** Automatic crop, light and colour once the shot is framed. */
+    val enhance: Boolean = true,
+    /** The camera can light the subject (flash unit, or the screen for the front camera). */
+    val hasFlash: Boolean = false,
 )
 
 class GuidanceFrame(
@@ -17,14 +21,20 @@ class GuidanceFrame(
     val checks: List<Check>,
     /** Short description of what the camera sees, e.g. "人像 · 半身 · 逆光". */
     val scene: String,
+    /** What the camera does automatically for this shot (crop, light, colour). */
+    val look: LookPlan = LookPlan.OFF,
 )
 
 /** Runs every analyzer on each frame. Keeps tracking state between frames; call from one thread. */
 class GuidanceEngine {
 
     private val composition = CompositionTracker()
+    private val look = LookEngine()
 
-    fun reset() = composition.reset()
+    fun reset() {
+        composition.reset()
+        look.reset()
+    }
 
     /** Use the cloud model's framing for the current subject (null drops it). */
     fun setExternal(f: ExternalFraming?) = composition.aim.setExternal(f)
@@ -36,6 +46,7 @@ class GuidanceEngine {
         val poseTips = PoseCoach.analyze(input.pose).sortedByDescending { it.severity.ordinal }
         val checks = Checklist.build(comp, lighting, input.aim.level, input.pose, poseTips)
         val scene = SceneAdvisor.describe(comp.subject, comp.shot, lighting)
-        return GuidanceFrame(input.pose, comp, lighting, poseTips, checks, scene)
+        val plan = look.update(nowMs, comp, lighting, input.pose, input)
+        return GuidanceFrame(input.pose, comp, lighting, poseTips, checks, scene, plan)
     }
 }

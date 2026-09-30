@@ -9,9 +9,11 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.os.SystemClock
 import android.util.AttributeSet
+import android.util.TypedValue
 import android.view.View
 import com.aucai.aicamera.core.AimPhase
 import com.aucai.aicamera.core.AimState
+import com.aucai.aicamera.core.CropPlan
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.RectN
@@ -24,9 +26,9 @@ import kotlin.math.sin
 
 /**
  * The guidance layer over the preview, kept deliberately sparse like a phone maker's camera:
- * a fixed centre ring with a target dot to aim at, two circles for the tilt angle, and a level
- * line that only shows up when the phone is nearly level. Assumes a FIT_CENTER preview with the
- * same aspect ratio as the analysed frames.
+ * a fixed centre ring with a target dot to aim at, two circles for the tilt angle, a level line that
+ * only shows up when the phone is nearly level, and, once framed, the automatic crop (everything
+ * outside it dimmed). Assumes a FIT_CENTER preview with the same aspect ratio as the analysed frames.
  */
 class GuideOverlayView @JvmOverloads constructor(
     context: Context,
@@ -49,6 +51,7 @@ class GuideOverlayView @JvmOverloads constructor(
     private var frameW = 3
     private var frameH = 4
     private var levelOkSince = 0L
+    private var cropSince = 0L
 
     private val dp = resources.displayMetrics.density
     private val yellow = Color.parseColor("#FFC940")
@@ -64,6 +67,16 @@ class GuideOverlayView @JvmOverloads constructor(
     private val shadow = Color.argb(120, 0, 0, 0)
     private val framePaint = stroke(yellow, 2f).apply {
         pathEffect = DashPathEffect(floatArrayOf(10 * dp, 7 * dp), 0f)
+    }
+
+    private val maskPaint = Paint().apply { color = Color.BLACK }
+    private val cropPaint = stroke(Color.WHITE, 1.5f)
+    private val cornerPaint = stroke(Color.WHITE, 3f).apply { strokeCap = Paint.Cap.ROUND }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics)
+        isFakeBoldText = true
+        setShadowLayer(3 * resources.displayMetrics.density, 0f, 0f, Color.argb(160, 0, 0, 0))
     }
 
     private val image = RectF()
@@ -103,7 +116,10 @@ class GuideOverlayView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         computeImageRect()
-        if (gridOn) drawGrid(canvas)
+        val look = frame?.look
+        val crop = look?.crop?.takeIf { look.engaged }
+        if (crop != null) drawCrop(canvas, crop) else cropSince = 0L
+        if (gridOn) drawGrid(canvas, crop?.rect)
         val aim = frame?.composition?.aim
         when (aim?.phase) {
             AimPhase.ANGLE -> drawAngle(canvas, aim)
@@ -119,12 +135,49 @@ class GuideOverlayView @JvmOverloads constructor(
         drawLevel(canvas, ringVisible = aim != null && aim.phase != AimPhase.IDLE)
     }
 
-    private fun drawGrid(canvas: Canvas) {
+    /** Dims what the automatic crop leaves out, so the preview shows the photo as it will be saved. */
+    private fun drawCrop(canvas: Canvas, crop: CropPlan) {
+        val now = SystemClock.uptimeMillis()
+        if (cropSince == 0L) cropSince = now
+        val fade = ((now - cropSince) / 250f).coerceIn(0f, 1f)
+        if (fade < 1f) postInvalidateOnAnimation()
+        val r = crop.rect
+        val l = image.left + r.left * image.width()
+        val t = image.top + r.top * image.height()
+        val rt = image.left + r.right * image.width()
+        val b = image.top + r.bottom * image.height()
+        maskPaint.alpha = (150 * fade).toInt()
+        canvas.drawRect(image.left, image.top, image.right, t, maskPaint)
+        canvas.drawRect(image.left, b, image.right, image.bottom, maskPaint)
+        canvas.drawRect(image.left, t, l, b, maskPaint)
+        canvas.drawRect(rt, t, image.right, b, maskPaint)
+        val a = (255 * fade).toInt()
+        cropPaint.alpha = (a * 0.7f).toInt()
+        canvas.drawRect(l, t, rt, b, cropPaint)
+        cornerPaint.alpha = a
+        val c = 16 * dp
+        for ((x, sx) in listOf(l to 1f, rt to -1f)) {
+            for ((y, sy) in listOf(t to 1f, b to -1f)) {
+                canvas.drawLine(x, y, x + sx * c, y, cornerPaint)
+                canvas.drawLine(x, y, x, y + sy * c, cornerPaint)
+            }
+        }
+        labelPaint.alpha = a
+        canvas.drawText(crop.label, l + 8 * dp, t + 8 * dp - labelPaint.ascent(), labelPaint)
+    }
+
+    /** Rule-of-thirds lines, of the crop when there is one (that is the photo). */
+    private fun drawGrid(canvas: Canvas, crop: RectN?) {
+        val r = crop ?: RectN(0f, 0f, 1f, 1f)
+        val l = image.left + r.left * image.width()
+        val t = image.top + r.top * image.height()
+        val w = r.width * image.width()
+        val h = r.height * image.height()
         for (p in listOf(1f / 3f, 2f / 3f)) {
-            val x = image.left + p * image.width()
-            val y = image.top + p * image.height()
-            canvas.drawLine(x, image.top, x, image.bottom, gridPaint)
-            canvas.drawLine(image.left, y, image.right, y, gridPaint)
+            val x = l + p * w
+            val y = t + p * h
+            canvas.drawLine(x, t, x, t + h, gridPaint)
+            canvas.drawLine(l, y, l + w, y, gridPaint)
         }
     }
 
