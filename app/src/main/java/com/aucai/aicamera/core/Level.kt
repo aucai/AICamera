@@ -10,6 +10,7 @@ import kotlin.math.sqrt
  * @property flat the phone is lying (nearly) flat, e.g. shooting food from above.
  * @property tiltX / tiltY for flat mode: tilt towards the screen's right / top edge in degrees.
  * @property pitchDeg 0 when the phone is held upright, 90 when it lies flat facing up or down.
+ * @property cameraPitchDeg where the back camera points: positive looking down, negative looking up.
  */
 data class LevelState(
     val rollDeg: Float,
@@ -17,6 +18,7 @@ data class LevelState(
     val tiltX: Float,
     val tiltY: Float,
     val pitchDeg: Float = 0f,
+    val cameraPitchDeg: Float = 0f,
 )
 
 object LevelMath {
@@ -37,6 +39,8 @@ object LevelMath {
         val tiltX = Math.toDegrees(asin((x / g).coerceIn(-1f, 1f).toDouble())).toFloat()
         val tiltY = Math.toDegrees(asin((y / g).coerceIn(-1f, 1f).toDouble())).toFloat()
         val pitch = Math.toDegrees(asin((abs(gz) / g).coerceIn(0f, 1f).toDouble())).toFloat()
-        return LevelState(roll, flat, tiltX, tiltY, pitch)
+        // Screen tilted towards the sky (gz > 0) means the back camera looks down.
+        val cameraPitch = Math.toDegrees(asin((gz / g).coerceIn(-1f, 1f).toDouble())).toFloat()
+        return LevelState(roll, flat, tiltX, tiltY, pitch, cameraPitch)
     }
 }

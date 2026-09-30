@@ -7,14 +7,14 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.aucai.aicamera.core.CropChoice
-import com.aucai.aicamera.core.GridMode
+import com.aucai.aicamera.core.AimInput
 import com.aucai.aicamera.core.GuidanceEngine
 import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.GuidanceInput
 import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.LumaGrid
 import com.aucai.aicamera.core.ObjectBox
+import com.aucai.aicamera.core.PortraitStyle
 
 /**
  * Turns each camera frame into an upright, display-oriented bitmap (mirrored for the
@@ -23,14 +23,16 @@ import com.aucai.aicamera.core.ObjectBox
  */
 class FrameAnalyzer(
     private val context: Context,
+    private val isSteady: () -> Boolean,
     private val onResult: (frame: GuidanceFrame, width: Int, height: Int) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
     @Volatile var frontCamera = false
     @Volatile var level: LevelState? = null
-    @Volatile var grid = GridMode.THIRDS
-    /** How photos are auto-cropped. */
-    @Volatile var crop = CropChoice.SAME
+    @Volatile var zoom = 1f
+    @Volatile var maxZoom = 1f
+    @Volatile var style = PortraitStyle.CLOSE
+    @Volatile var assistEnabled = true
 
     /** Set from any thread to drop tracking state, e.g. after switching cameras. */
     @Volatile var resetRequested = false
@@ -60,7 +62,8 @@ class FrameAnalyzer(
                 objects = emptyList()
             }
             val frameAspect = upright.width.toFloat() / upright.height
-            val input = GuidanceInput(pose, objects, luma, level, grid, frameAspect, crop.aspect(frameAspect))
+            val aim = AimInput(frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled)
+            val input = GuidanceInput(pose, objects, luma, aim)
             val frame = engine.analyze(now, input)
             onResult(frame, upright.width, upright.height)
         } catch (t: Throwable) {

@@ -10,36 +10,28 @@ object Checklist {
 
     fun build(
         comp: CompositionResult,
-        sceneTips: List<Tip>,
         lighting: LightingResult?,
         level: LevelState?,
         pose: PoseFrame?,
         poseTips: List<Tip>,
     ): List<Check> {
         val checks = ArrayList<Check>()
-        val ids = (comp.tips + sceneTips).map { it.id }.toSet()
         val subject = comp.subject
+        val fs = comp.frameSubject
 
         checks += when {
             subject == null -> Check(false, "没找到主体")
-            "comp.room" in ids -> Check(false, "主体太靠边")
-            else -> Check(true, "构图到位")
+            comp.aim.phase == AimPhase.DONE -> Check(true, "构图到位")
+            else -> Check(false, "构图没对准")
         }
 
-        when (subject?.kind) {
-            SubjectKind.PERSON -> checks += when {
-                "comp.headcut" in ids -> Check(false, "头顶被切")
-                "comp.feetcut" in ids -> Check(false, "脚被切")
-                "comp.jointcut" in ids -> Check(false, "切到关节")
-                "comp.small" in ids -> Check(false, "人太小")
-                else -> Check(true, "人物完整")
-            }
-            SubjectKind.OBJECT -> checks += when {
-                "comp.objcut" in ids -> Check(false, "主体被切")
-                "comp.objsmall" in ids || "scene.food.close" in ids -> Check(false, "主体太小")
+        if (fs != null && fs.kind != SubjectKind.HORIZON) {
+            val issue = CompositionRules.completenessIssues(fs).firstOrNull()
+            checks += when {
+                issue != null -> Check(false, issue)
+                fs.kind == SubjectKind.PERSON -> Check(true, "人物完整")
                 else -> Check(true, "主体完整")
             }
-            else -> Unit
         }
 
         if (level != null) {

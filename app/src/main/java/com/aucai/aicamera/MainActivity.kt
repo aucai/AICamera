@@ -1,9 +1,9 @@
 package com.aucai.aicamera
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.ContentUris
-import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -24,56 +24,52 @@ import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
-import android.widget.SeekBar
-import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.aucai.aicamera.camera.FrameAnalyzer
 import com.aucai.aicamera.camera.LevelSensor
-import com.aucai.aicamera.core.GridMode
-import com.aucai.aicamera.core.GuidanceFrame
-import com.aucai.aicamera.core.Mode
-import com.aucai.aicamera.core.Severity
-import com.aucai.aicamera.core.Check
-import com.aucai.aicamera.core.CropChoice
-import com.aucai.aicamera.core.RectN
 import com.aucai.aicamera.camera.PhotoWriter
-import com.aucai.aicamera.ui.CheckText
-import androidx.camera.core.ImageProxy
-import com.aucai.aicamera.core.Tip
-import com.aucai.aicamera.core.TipAction
-import com.aucai.aicamera.core.TipCategory
+import com.aucai.aicamera.core.AimPhase
+import com.aucai.aicamera.core.GuidanceFrame
+import com.aucai.aicamera.core.PortraitStyle
+import com.aucai.aicamera.core.RectN
+import com.aucai.aicamera.core.Severity
+import com.aucai.aicamera.core.Sharpness
+import com.aucai.aicamera.core.SubjectKind
 import com.aucai.aicamera.core.TipStabilizer
 import com.aucai.aicamera.databinding.ActivityMainBinding
-import com.aucai.aicamera.databinding.ViewTipBinding
 import com.aucai.aicamera.ui.PhotoReview
 import com.aucai.aicamera.ui.ReviewStore
 import com.aucai.aicamera.ui.Speaker
-import com.aucai.aicamera.core.Sharpness
-import androidx.camera.extensions.ExtensionMode
-import androidx.camera.extensions.ExtensionsManager
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
@@ -81,32 +77,41 @@ class MainActivity : AppCompatActivity() {
     private lateinit var analyzer: FrameAnalyzer
     private lateinit var levelSensor: LevelSensor
     private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val photoExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val stabilizer = TipStabilizer()
+    private val poseTipStabilizer = TipStabilizer(showAfterMs = 800, hideAfterMs = 1500)
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+    private val reviews by lazy { ReviewStore(this) }
     private var speaker: Speaker? = null
 
     private var camera: Camera? = null
+    private var boundInfo: CameraInfo? = null
     private var preview: Preview? = null
     private var imageCapture: ImageCapture? = null
     private var imageAnalysis: ImageAnalysis? = null
+    private var extensionsManager: ExtensionsManager? = null
     private var lensFacing = CameraSelector.LENS_FACING_BACK
 
-    private var mode = Mode.SMART
-    private var grid = GridMode.THIRDS
+    // Settings
+    private var assistOn = true
+    private var gridOn = true
     private var timerSeconds = 0
-    private var voiceOn = true
+    private var voiceOn = false
+    private var style = PortraitStyle.CLOSE
 
+    // Live state
     private var lastFrame: GuidanceFrame? = null
-    private var wasAllGood = false
+    private var lastPhase = AimPhase.IDLE
+    private var doneSince = 0L
     private var lastPhotoUri: Uri? = null
     private var countdownLeft = 0
-    private var cropChoice = CropChoice.SAME
-    private val photoExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private var extensionsManager: ExtensionsManager? = null
-    private var extensionActive = false
     private var capturing = false
-    private val reviews by lazy { ReviewStore(this) }
+    private var zoomAnimator: ValueAnimator? = null
+    private var zoomAnimTarget = 0f
+    private var manualFocusAt = 0L
+    private var faceMeterAt = 0L
+    private var faceMeterX = -1f
+    private var faceMeterY = -1f
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -123,17 +128,18 @@ class MainActivity : AppCompatActivity() {
         loadSettings()
         applyInsets()
 
-        analyzer = FrameAnalyzer(this) { frame, w, h -> runOnUiThread { onFrame(frame, w, h) } }
-        analyzer.grid = grid
-        analyzer.crop = cropChoice
         levelSensor = LevelSensor(this) { level ->
             analyzer.level = level
             binding.overlay.level = level
         }
         levelSensor.displayRotationDeg = displayRotationDegrees()
+        analyzer = FrameAnalyzer(this, { levelSensor.isSteady }) { frame, w, h -> runOnUiThread { onFrame(frame, w, h) } }
+        analyzer.style = style
+        analyzer.assistEnabled = assistOn
 
         setupControls()
         renderSettings()
+
         if (hasCameraPermission()) startCamera() else requestCamera.launch(Manifest.permission.CAMERA)
     }
 
@@ -151,6 +157,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        zoomAnimator?.cancel()
         analysisExecutor.execute { analyzer.close() }
         analysisExecutor.shutdown()
         photoExecutor.shutdown()
@@ -164,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         imageCapture?.targetRotation = rotation
         imageAnalysis?.targetRotation = rotation
         levelSensor.displayRotationDeg = displayRotationDegrees()
-        renderSettings()
+        analyzer.resetRequested = true
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -203,6 +210,13 @@ class MainActivity : AppCompatActivity() {
         val fourByThree = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .build()
+        val fullResolution = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            // ~12 MP keeps a decoded frame comfortably in memory.
+            .setResolutionStrategy(
+                ResolutionStrategy(Size(4000, 3000), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
+            )
+            .build()
         val analysisSize = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(
@@ -215,13 +229,6 @@ class MainActivity : AppCompatActivity() {
             .setTargetRotation(rotation)
             .build()
         preview.setSurfaceProvider(binding.previewView.surfaceProvider)
-        val fullResolution = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-            // ~12 MP: plenty after cropping, and a decoded frame still fits comfortably in memory.
-            .setResolutionStrategy(
-                ResolutionStrategy(Size(4000, 3000), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER)
-            )
-            .build()
         val capture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             .setJpegQuality(95)
@@ -257,21 +264,28 @@ class MainActivity : AppCompatActivity() {
                 null
             }
         }
-        extensionActive = bound != null
-        try {
-            camera = bound ?: provider.bindToLifecycle(this, base, preview, capture, analysis)
-            this.preview = preview
-            imageCapture = capture
-            imageAnalysis = analysis
+        val cam = try {
+            bound ?: provider.bindToLifecycle(this, base, preview, capture, analysis)
         } catch (e: Exception) {
             Log.e(TAG, "bind failed", e)
             toast("相机启动失败：${e.message}")
             return
         }
-        stabilizer.reset()
+        camera = cam
+        this.preview = preview
+        imageCapture = capture
+        imageAnalysis = analysis
+
+        // The composition assistant needs to know the zoom it works at and how far it may go.
+        boundInfo?.zoomState?.removeObservers(this)
+        boundInfo = cam.cameraInfo
+        cam.cameraInfo.zoomState.observe(this) { z ->
+            analyzer.zoom = z.zoomRatio
+            analyzer.maxZoom = min(z.maxZoomRatio, MAX_ASSIST_ZOOM).coerceAtLeast(z.zoomRatio)
+        }
+        analyzer.resetRequested = true
         lastFrame = null
         binding.overlay.clear()
-        setupExposure()
     }
 
     private fun switchCamera() {
@@ -280,48 +294,30 @@ class MainActivity : AppCompatActivity() {
         } else {
             CameraSelector.LENS_FACING_BACK
         }
-        analyzer.resetRequested = true
+        zoomAnimator?.cancel()
         if (hasCameraPermission()) startCamera()
     }
 
-    private fun meterAt(viewX: Float, viewY: Float) {
+    private fun meterAt(viewX: Float, viewY: Float, flags: Int, cancelAfterSec: Long? = 5) {
         val cam = camera ?: return
         val point = binding.previewView.meteringPointFactory.createPoint(viewX, viewY)
-        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-            .setAutoCancelDuration(5, TimeUnit.SECONDS)
-            .build()
-        cam.cameraControl.startFocusAndMetering(action)
+        val builder = FocusMeteringAction.Builder(point, flags)
+        if (cancelAfterSec == null) builder.disableAutoCancel() else builder.setAutoCancelDuration(cancelAfterSec, TimeUnit.SECONDS)
+        cam.cameraControl.startFocusAndMetering(builder.build())
     }
 
-    private fun setupExposure() {
-        val state = camera?.cameraInfo?.exposureState
-        val supported = state != null && state.isExposureCompensationSupported
-        binding.exposureSeek.isEnabled = supported
-        if (state == null || !supported) {
-            binding.exposureRow.visibility = View.GONE
-            return
-        }
-        val range = state.exposureCompensationRange
-        binding.exposureSeek.max = range.upper - range.lower
-        binding.exposureSeek.progress = state.exposureCompensationIndex - range.lower
-        updateExposureLabel(state.exposureCompensationIndex)
-        binding.exposureRow.visibility = if (mode == Mode.LIGHT) View.VISIBLE else View.GONE
-    }
-
-    private fun setExposureIndex(index: Int) {
+    /** Smoothly moves the camera zoom, the way the assistant "finishes" a composition. */
+    private fun animateZoomTo(target: Float) {
         val cam = camera ?: return
-        val state = cam.cameraInfo.exposureState
-        if (!state.isExposureCompensationSupported) return
-        val range = state.exposureCompensationRange
-        val clamped = index.coerceIn(range.lower, range.upper)
-        cam.cameraControl.setExposureCompensationIndex(clamped)
-        binding.exposureSeek.progress = clamped - range.lower
-        updateExposureLabel(clamped)
-    }
-
-    private fun updateExposureLabel(index: Int) {
-        val step = camera?.cameraInfo?.exposureState?.exposureCompensationStep?.toFloat() ?: 0f
-        binding.exposureLabel.text = "曝光 %+.1f".format(index * step)
+        if (zoomAnimator?.isRunning == true && abs(zoomAnimTarget - target) < 0.02f) return
+        val from = cam.cameraInfo.zoomState.value?.zoomRatio ?: return
+        zoomAnimator?.cancel()
+        zoomAnimTarget = target
+        zoomAnimator = ValueAnimator.ofFloat(from, target).apply {
+            duration = 600
+            addUpdateListener { camera?.cameraControl?.setZoomRatio(it.animatedValue as Float) }
+            start()
+        }
     }
 
     // ----------------------------------------------------------------- frames
@@ -330,88 +326,81 @@ class MainActivity : AppCompatActivity() {
         if (isFinishing) return
         lastFrame = frame
         binding.overlay.update(frame, width, height)
+        val now = SystemClock.elapsedRealtime()
+        val aim = frame.composition.aim
+        val subject = frame.composition.subject
 
-        var tips = frame.tips.filter { it.category in mode.categories }
-        if (mode == Mode.POSE && frame.pose == null) {
-            tips = tips + Tip("pose.none", TipCategory.POSE, Severity.INFO, "没有检测到人物，把人框进画面")
+        if (aim.phase != lastPhase) {
+            if (aim.phase == AimPhase.DONE) doneSince = now
+            if (aim.phase == AimPhase.HOLD || aim.phase == AimPhase.DONE) {
+                binding.overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+            }
+            lastPhase = aim.phase
         }
-        val visible = stabilizer.update(SystemClock.elapsedRealtime(), tips)
-        renderTips(visible)
+        if (aim.phase == AimPhase.ZOOM) aim.zoomTo?.let { animateZoomTo(it) }
+        binding.shutter.ready = aim.phase == AimPhase.DONE
 
-        val checks = checksFor(frame)
-        val passed = CheckText.passed(checks)
-        binding.shutter.checks = passed
-        binding.checkList.visibility = View.VISIBLE
-        binding.checkList.text = CheckText.format(this, checks)
-        binding.sceneChip.visibility = View.VISIBLE
-        binding.sceneChip.text = "AI 识别：${frame.scene}"
-        val reason = frame.composition.plan.reason
-        val showReason = reason.isNotEmpty() && (mode == Mode.SMART || mode == Mode.COMPOSITION)
-        binding.reasonChip.visibility = if (showReason) View.VISIBLE else View.GONE
-        binding.reasonChip.text = "AI 取景：$reason"
+        autoMeterOnFace(frame, now)
 
-        val allGood = passed.first == passed.second
-        if (allGood && !wasAllGood) binding.overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        wasAllGood = allGood
+        // Scene label, short like a phone maker's "AI" badge.
+        binding.sceneChip.visibility = if (subject != null) View.VISIBLE else View.GONE
+        binding.sceneChip.text = frame.scene.substringBefore(" · ")
+        binding.lightBadge.visibility =
+            if (frame.lighting?.backlit == true && subject?.kind == SubjectKind.PERSON) View.VISIBLE else View.GONE
 
-        if (voiceOn && countdownLeft == 0) {
-            visible.firstOrNull { it.severity != Severity.INFO }?.let { speaker?.say(it.text) }
+        val showStyles = assistOn && subject?.kind == SubjectKind.PERSON
+        binding.styleChips.visibility = if (showStyles) View.VISIBLE else View.INVISIBLE
+
+        showHint(hintFor(frame, now))
+    }
+
+    /** One short line at a time: the current step, then (once framed) a pose tip or a light problem. */
+    private fun hintFor(frame: GuidanceFrame, now: Long): String {
+        val aim = frame.composition.aim
+        val poseTip = poseTipStabilizer.update(now, frame.poseTips.filter { it.severity != Severity.INFO })
+            .firstOrNull()?.text
+        val lightTip = frame.lighting?.let {
+            when {
+                it.mean < 45f -> "光线太暗，靠近光源或开灯"
+                it.highRatio > 0.2f -> "画面太亮，换个角度避开强光"
+                else -> null
+            }
+        }
+        if (!assistOn) return lightTip ?: ""
+        return when (aim.phase) {
+            AimPhase.IDLE -> lightTip ?: if (frame.composition.subject == null) "对准想拍的人或物" else ""
+            AimPhase.DONE -> if (now - doneSince < 1500) aim.hint else poseTip ?: lightTip ?: aim.hint
+            else -> aim.hint
         }
     }
 
-    /** The frame's checks plus one the analysis thread cannot know: is the phone being held still. */
-    private fun checksFor(frame: GuidanceFrame): List<Check> {
-        val steady = levelSensor.isSteady
-        return frame.checks + Check(steady, if (steady) "手机稳定" else "手在抖")
-    }
-
-    private fun renderTips(tips: List<Tip>) {
-        bindTip(binding.tip1, tips.getOrNull(0))
-        bindTip(binding.tip2, tips.getOrNull(1))
-    }
-
-    private fun bindTip(view: ViewTipBinding, tip: Tip?) {
-        if (tip == null) {
-            view.root.visibility = View.GONE
+    private fun showHint(text: String) {
+        if (text.isEmpty()) {
+            binding.hint.visibility = View.INVISIBLE
             return
         }
-        view.root.visibility = View.VISIBLE
-        view.badge.text = tip.category.label
-        view.badge.background.mutate().setTint(
-            when (tip.severity) {
-                Severity.WARNING -> ContextCompat.getColor(this, R.color.bad)
-                Severity.SUGGEST -> ContextCompat.getColor(this, R.color.accent)
-                Severity.INFO -> Color.WHITE
-            }
-        )
-        view.text.text = tip.text
-        val action = tip.action
-        if (action == null) {
-            view.action.visibility = View.GONE
-            view.action.setOnClickListener(null)
-        } else {
-            view.action.visibility = View.VISIBLE
-            view.action.text = action.label
-            view.action.setOnClickListener { performAction(action) }
+        if (binding.hint.text != text) {
+            binding.hint.text = text
+            if (voiceOn && countdownLeft == 0) speaker?.say(text)
         }
+        binding.hint.visibility = View.VISIBLE
     }
 
-    private fun performAction(action: TipAction) {
-        val state = camera?.cameraInfo?.exposureState ?: return
-        when (action) {
-            TipAction.METER_SUBJECT -> {
-                val p = lastFrame?.lighting?.meterPoint
-                if (p == null) {
-                    setExposureIndex(state.exposureCompensationIndex + 2)
-                } else {
-                    val (vx, vy) = binding.overlay.toView(p.x, p.y)
-                    meterAt(vx, vy)
-                }
-                toast("已对人物测光")
-            }
-            TipAction.EXPOSURE_UP -> setExposureIndex(state.exposureCompensationIndex + 2)
-            TipAction.EXPOSURE_DOWN -> setExposureIndex(state.exposureCompensationIndex - 2)
-        }
+    /**
+     * Keeps exposure right for the person automatically (this is what fixes backlit faces), unless
+     * the user tapped to focus a moment ago. Exposure only, so focus does not hunt.
+     */
+    private fun autoMeterOnFace(frame: GuidanceFrame, now: Long) {
+        if (now - manualFocusAt < 5000) return
+        val face = frame.pose?.faceBounds()?.clamp01() ?: return
+        val c = face.center
+        val moved = hypot(c.x - faceMeterX, c.y - faceMeterY) > 0.08f
+        if (!moved && now - faceMeterAt < 3000) return
+        faceMeterAt = now
+        faceMeterX = c.x
+        faceMeterY = c.y
+        val (vx, vy) = binding.overlay.toView(c.x, c.y)
+        meterAt(vx, vy, FocusMeteringAction.FLAG_AE, cancelAfterSec = null)
     }
 
     // ---------------------------------------------------------------- capture
@@ -469,7 +458,10 @@ class MainActivity : AppCompatActivity() {
             binding.previewView.width / 2f to binding.previewView.height / 2f
         }
         val point = binding.previewView.meteringPointFactory.createPoint(vx, vy)
-        val focus = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+        // A new metering action replaces the automatic face exposure, so meter on the subject too;
+        // otherwise a backlit face would go dark again at the moment of capture.
+        val flags = if (subject != null) FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE else FocusMeteringAction.FLAG_AF
+        val focus = FocusMeteringAction.Builder(point, flags)
             .setAutoCancelDuration(3, TimeUnit.SECONDS)
             .build()
         var started = false
@@ -491,24 +483,24 @@ class MainActivity : AppCompatActivity() {
         capture(frame)
     }
 
-    /**
-     * Captures at full resolution, then crops to the planned framing, turns the image upright and saves it.
-     * What gets saved is exactly the bright area shown in the viewfinder.
-     */
+    /** Captures at full resolution, turns the image upright (mirrored for selfies) and saves it. */
     private fun capture(frame: GuidanceFrame?) {
         val capture = imageCapture ?: run {
             capturing = false
             return
         }
         val fileName = "AICamera_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
-        val crop = frame?.composition?.plan?.rect ?: RectN(0f, 0f, 1f, 1f)
         val mirror = lensFacing == CameraSelector.LENS_FACING_FRONT
-        val checks = frame?.let { checksFor(it) }
 
-        // Remember what the camera saw and checked, for the review in the gallery.
-        if (frame != null && checks != null) {
-            val tips = frame.tips.filter { it.severity != Severity.INFO }.map { it.text }.distinct()
-            reviews.put(fileName, PhotoReview(frame.scene, frame.composition.plan.reason, checks, tips))
+        // Remember what the camera saw, for the review in the gallery.
+        if (frame != null) {
+            val aim = frame.composition.aim
+            val tips = (frame.poseTips + (frame.lighting?.tips ?: emptyList()))
+                .filter { it.severity != Severity.INFO }
+                .map { it.text }
+                .distinct()
+            val reason = if (aim.phase == AimPhase.DONE) aim.reason else ""
+            reviews.put(fileName, PhotoReview(frame.scene, reason, frame.checks, tips))
         }
 
         flash()
@@ -518,7 +510,7 @@ class MainActivity : AppCompatActivity() {
                     val rotation = image.imageInfo.rotationDegrees
                     val src = image.toBitmap()
                     image.close()
-                    val out = PhotoWriter.cropUpright(src, crop, rotation, mirror)
+                    val out = PhotoWriter.cropUpright(src, RectN(0f, 0f, 1f, 1f), rotation, mirror)
                     val blurry = PhotoWriter.sharpness(out) < Sharpness.BLURRY_BELOW
                     if (blurry) reviews.markBlurry(fileName)
                     PhotoWriter.save(contentResolver, out, fileName)?.let { it to blurry }
@@ -537,12 +529,7 @@ class MainActivity : AppCompatActivity() {
                     val (uri, blurry) = saved
                     lastPhotoUri = uri
                     showThumbnail(uri)
-                    val note = when {
-                        blurry -> "这张可能有点糊，拿稳再拍一张"
-                        checks != null -> "已保存 · ${checks.count { it.ok }}/${checks.size} 项达标 · 点左下角看点评"
-                        else -> "已保存"
-                    }
-                    showCaptureNote(note, 3000)
+                    showCaptureNote(if (blurry) "这张可能有点糊，拿稳再拍一张" else "已保存，点左下角看点评", 2500)
                 }
             }
 
@@ -606,28 +593,23 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun openGallery() {
-        startActivity(Intent(this, GalleryActivity::class.java))
-    }
-
     // --------------------------------------------------------------- controls
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupControls() {
         binding.shutter.setOnClickListener { onShutter() }
         binding.btnSwitch.setOnClickListener { switchCamera() }
-        binding.thumbnail.setOnClickListener { openGallery() }
+        binding.thumbnail.setOnClickListener { startActivity(Intent(this, GalleryActivity::class.java)) }
         binding.btnPermission.setOnClickListener { requestCamera.launch(Manifest.permission.CAMERA) }
 
-        binding.btnGrid.setOnClickListener {
-            grid = GridMode.entries[(grid.ordinal + 1) % GridMode.entries.size]
-            analyzer.grid = grid
+        binding.btnAssist.setOnClickListener {
+            assistOn = !assistOn
+            analyzer.assistEnabled = assistOn
             saveSettings()
             renderSettings()
         }
-        binding.btnCrop.setOnClickListener {
-            cropChoice = CropChoice.entries[(cropChoice.ordinal + 1) % CropChoice.entries.size]
-            analyzer.crop = cropChoice
+        binding.btnGrid.setOnClickListener {
+            gridOn = !gridOn
             saveSettings()
             renderSettings()
         }
@@ -651,39 +633,15 @@ class MainActivity : AppCompatActivity() {
                 }, 1500)
             }
         }
-
-        val tabs = mapOf(
-            binding.tabSmart to Mode.SMART,
-            binding.tabComposition to Mode.COMPOSITION,
-            binding.tabPose to Mode.POSE,
-            binding.tabLight to Mode.LIGHT,
-        )
-        for ((view, m) in tabs) {
-            view.text = m.label
-            view.setOnClickListener {
-                mode = m
-                stabilizer.reset()
-                saveSettings()
-                renderSettings()
-            }
-        }
-
-        binding.exposureSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
-                if (!fromUser) return
-                val lower = camera?.cameraInfo?.exposureState?.exposureCompensationRange?.lower ?: return
-                setExposureIndex(progress + lower)
-            }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
-            override fun onStopTrackingTouch(seekBar: SeekBar) = Unit
-        })
+        binding.chipClose.setOnClickListener { chooseStyle(PortraitStyle.CLOSE) }
+        binding.chipScene.setOnClickListener { chooseStyle(PortraitStyle.SCENE) }
 
         // Tap to focus/meter, pinch to zoom.
         val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 val cam = camera ?: return false
                 val zoom = cam.cameraInfo.zoomState.value ?: return false
+                zoomAnimator?.cancel()
                 val next = (zoom.zoomRatio * detector.scaleFactor).coerceIn(zoom.minZoomRatio, zoom.maxZoomRatio)
                 cam.cameraControl.setZoomRatio(next)
                 return true
@@ -692,45 +650,44 @@ class MainActivity : AppCompatActivity() {
         binding.previewView.setOnTouchListener { v, e ->
             scale.onTouchEvent(e)
             if (e.actionMasked == MotionEvent.ACTION_UP && !scale.isInProgress && e.eventTime - e.downTime < 250) {
-                meterAt(e.x, e.y)
+                manualFocusAt = SystemClock.elapsedRealtime()
+                meterAt(e.x, e.y, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
                 v.performClick()
             }
             true
         }
     }
 
+    private fun chooseStyle(s: PortraitStyle) {
+        if (style == s) return
+        style = s
+        analyzer.style = s
+        // "People in their surroundings" is framed at the widest view.
+        if (s == PortraitStyle.SCENE) {
+            camera?.cameraInfo?.zoomState?.value?.minZoomRatio?.let { animateZoomTo(maxOf(1f, it)) }
+        }
+        saveSettings()
+        renderSettings()
+    }
+
     private fun renderSettings() {
-        binding.overlay.mode = mode
-        binding.overlay.grid = grid
-        binding.btnGrid.text = grid.label
-        val portrait = resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
-        binding.btnCrop.text = cropChoice.label(portrait)
-        binding.btnCrop.setTextColor(if (cropChoice == CropChoice.OFF) Color.WHITE else ContextCompat.getColor(this, R.color.accent))
+        val accent = ContextCompat.getColor(this, R.color.accent)
+        binding.overlay.gridOn = gridOn
+        binding.btnAssist.text = if (assistOn) "构图助手" else "助手关"
+        binding.btnAssist.setTextColor(if (assistOn) accent else Color.WHITE)
+        binding.btnGrid.text = if (gridOn) "网格开" else "网格关"
+        binding.btnGrid.setTextColor(if (gridOn) accent else Color.WHITE)
         binding.btnTimer.text = if (timerSeconds == 0) "定时关" else "${timerSeconds}秒"
+        binding.btnTimer.setTextColor(if (timerSeconds == 0) Color.WHITE else accent)
         binding.btnVoice.text = if (voiceOn) "语音开" else "语音关"
+        binding.btnVoice.setTextColor(if (voiceOn) accent else Color.WHITE)
         binding.btnVoice.setCompoundDrawablesRelativeWithIntrinsicBounds(
             0, if (voiceOn) R.drawable.ic_voice_on else R.drawable.ic_voice_off, 0, 0
         )
-        val accent = ContextCompat.getColor(this, R.color.accent)
-        val secondary = ContextCompat.getColor(this, R.color.text_secondary)
-        binding.btnGrid.setTextColor(if (grid == GridMode.OFF) Color.WHITE else accent)
-        binding.btnTimer.setTextColor(if (timerSeconds == 0) Color.WHITE else accent)
-        binding.btnVoice.setTextColor(if (voiceOn) accent else Color.WHITE)
-        val tabs = listOf(
-            binding.tabSmart to Mode.SMART,
-            binding.tabComposition to Mode.COMPOSITION,
-            binding.tabPose to Mode.POSE,
-            binding.tabLight to Mode.LIGHT,
-        )
-        for ((view, m) in tabs) styleTab(view, m == mode, accent, secondary)
-        val exposureSupported = camera?.cameraInfo?.exposureState?.isExposureCompensationSupported == true
-        binding.exposureRow.visibility = if (mode == Mode.LIGHT && exposureSupported) View.VISIBLE else View.GONE
+        binding.chipClose.isSelected = style == PortraitStyle.CLOSE
+        binding.chipScene.isSelected = style == PortraitStyle.SCENE
+        if (!assistOn) binding.overlay.clear()
         if (voiceOn) ensureSpeaker()
-    }
-
-    private fun styleTab(view: TextView, selected: Boolean, accent: Int, secondary: Int) {
-        view.setTextColor(if (selected) accent else secondary)
-        view.setTypeface(null, if (selected) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
     }
 
     private fun ensureSpeaker() {
@@ -738,20 +695,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadSettings() {
-        mode = Mode.entries.getOrNull(prefs.getInt("mode", 0)) ?: Mode.SMART
-        grid = GridMode.entries.getOrNull(prefs.getInt("grid", 0)) ?: GridMode.THIRDS
+        assistOn = prefs.getBoolean("assist", true)
+        gridOn = prefs.getBoolean("gridOn", true)
         timerSeconds = prefs.getInt("timer", 0)
-        voiceOn = prefs.getBoolean("voice", true)
-        cropChoice = CropChoice.entries.getOrNull(prefs.getInt("crop", 0)) ?: CropChoice.SAME
+        voiceOn = prefs.getBoolean("voice2", false)
+        style = PortraitStyle.entries.getOrNull(prefs.getInt("style", 0)) ?: PortraitStyle.CLOSE
     }
 
     private fun saveSettings() {
         prefs.edit()
-            .putInt("mode", mode.ordinal)
-            .putInt("grid", grid.ordinal)
+            .putBoolean("assist", assistOn)
+            .putBoolean("gridOn", gridOn)
             .putInt("timer", timerSeconds)
-            .putBoolean("voice", voiceOn)
-            .putInt("crop", cropChoice.ordinal)
+            .putBoolean("voice2", voiceOn)
+            .putInt("style", style.ordinal)
             .apply()
     }
 
@@ -781,5 +738,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "AICamera"
+        /** Beyond this the assistant does not zoom on its own (digital zoom gets soft). */
+        private const val MAX_ASSIST_ZOOM = 3f
     }
 }

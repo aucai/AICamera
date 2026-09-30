@@ -5,7 +5,9 @@
     <string name="grant_permission">授予相机权限</string>
     <string name="gallery">相册</string>
     <string name="switch_camera">切换镜头</string>
-    <string name="exposure">曝光</string>
+    <string name="backlight_fix">逆光优化</string>
+    <string name="style_close">人物特写</string>
+    <string name="style_scene">人景合一</string>
     <string name="no_photos">还没有用这个 App 拍过照片</string>
     <string name="back">返回</string>
     <string name="share">分享</string>

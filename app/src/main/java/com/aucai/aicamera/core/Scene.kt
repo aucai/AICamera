@@ -148,7 +148,7 @@ object HorizonDetector {
     }
 }
 
-/** A one-line description of what the camera sees, plus advice specific to that kind of scene. */
+/** A one-line description of what the camera sees. */
 object SceneAdvisor {
 
     fun describe(subject: Subject?, shot: ShotType?, lighting: LightingResult?): String {
@@ -178,37 +178,5 @@ object SceneAdvisor {
             }
         }
         return parts.joinToString(" · ")
-    }
-
-    fun tips(subject: Subject?, level: LevelState?): List<Tip> {
-        if (subject == null || subject.kind != SubjectKind.OBJECT) return emptyList()
-        val tips = ArrayList<Tip>()
-        val box = subject.box
-        val area = box?.let { it.width * it.height } ?: 0f
-        val pitch = level?.pitchDeg
-        when (subject.group) {
-            ObjectGroup.FOOD -> {
-                if (pitch != null && pitch < 30f) {
-                    tips += Tip("scene.food.angle", TipCategory.COMPOSITION, Severity.SUGGEST, "拍美食：手机往前倾，45°斜拍或俯拍更有食欲")
-                }
-                if (area < 0.15f) {
-                    tips += Tip("scene.food.close", TipCategory.COMPOSITION, Severity.SUGGEST, "手机靠近一点，让食物占满画面")
-                }
-            }
-            ObjectGroup.PET -> if (pitch != null && pitch > 40f) {
-                tips += Tip("scene.pet.low", TipCategory.COMPOSITION, Severity.SUGGEST, "手机放低到${subject.label}眼睛的高度，拍出来更生动")
-            }
-            ObjectGroup.PLANT -> tips += Tip("scene.plant", TipCategory.COMPOSITION, Severity.INFO, "拍花草可以靠近一点，背景越简单越好")
-            else -> Unit
-        }
-        if (box != null) {
-            val touches = box.left < 0.01f || box.top < 0.01f || box.right > 0.99f || box.bottom > 0.99f
-            if (touches && area < 0.6f) {
-                tips += Tip("comp.objcut", TipCategory.COMPOSITION, Severity.SUGGEST, "${subject.label}被画面边缘切到了，手机往后退一点")
-            } else if (area < 0.03f && subject.group != ObjectGroup.FOOD) {
-                tips += Tip("comp.objsmall", TipCategory.COMPOSITION, Severity.SUGGEST, "${subject.label}太小了，手机靠近一点")
-            }
-        }
-        return tips
     }
 }

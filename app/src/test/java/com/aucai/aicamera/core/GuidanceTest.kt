@@ -51,96 +51,36 @@ class GuidanceTest {
     private val level = LevelState(0f, false, 0f, 90f)
     private val portrait = 0.75f
 
-    private fun CompositionTracker.feed(
-        now: Long,
-        pose: PoseFrame?,
-        crop: CropChoice = CropChoice.SAME,
-        grid: GridMode = GridMode.THIRDS,
-    ) = update(now, SubjectPicker.pick(pose, emptyList(), null), pose, level, grid, portrait, crop.aspect(portrait))
+    private fun aimInput(
+        style: PortraitStyle = PortraitStyle.CLOSE,
+        zoom: Float = 1f,
+        pitch: Float = 0f,
+        front: Boolean = false,
+        steady: Boolean = true,
+    ) = AimInput(portrait, LevelState(0f, false, 0f, 90f, 0f, pitch), zoom, 3f, steady, style, front)
 
-    /** Runs the tracker long enough for the crop to settle. */
-    private fun settle(pose: PoseFrame, crop: CropChoice = CropChoice.SAME): CompositionResult {
-        val t = CompositionTracker()
-        var r = t.feed(0, pose, crop)
-        repeat(30) { r = t.feed(100L * (it + 1), pose, crop) }
+    private fun CompositionTracker.feed(now: Long, pose: PoseFrame?, input: AimInput = aimInput()) =
+        update(now, SubjectPicker.pick(pose, emptyList(), null), pose, input)
+
+    /** Feeds the same pose for [frames] frames 100 ms apart, starting at [start]. */
+    private fun CompositionTracker.run(
+        pose: PoseFrame,
+        input: AimInput = aimInput(),
+        start: Long = 0,
+        frames: Int = 10,
+    ): CompositionResult {
+        var r = feed(start, pose, input)
+        for (i in 1 until frames) r = feed(start + i * 100L, pose, input)
         return r
     }
 
-    private fun eyesInCrop(r: CompositionResult): Vec2 {
-        val a = r.frameSubject!!.anchor
-        val c = r.plan.rect
-        return Vec2((a.x - c.left) / c.width, (a.y - c.top) / c.height)
-    }
+    /** The pose moved by [dx], [dy]. */
+    private fun PoseFrame.shifted(dx: Float, dy: Float) =
+        PoseFrame(landmarks.map { it.copy(x = it.x + dx, y = it.y + dy) }, aspect)
 
-    @Test
-    fun halfBodyCropPutsEyesOnUpperThird() {
-        val r = settle(person(dx = 0.05f, fullBody = false))
-        val e = eyesInCrop(r)
-        assertEquals(1f / 3f, e.y, 0.06f)
-        assertTrue("reason: ${r.plan.reason}", r.plan.reason.contains("三分线"))
-        // Head must stay inside the crop.
-        assertTrue(r.frameSubject!!.headTop!! >= r.plan.rect.top)
-    }
-
-    @Test
-    fun personLookingRightGetsRoomOnTheRight() {
-        val r = settle(person(dx = 0.02f, fullBody = false, lookRight = true))
-        assertEquals(1, r.frameSubject!!.facing)
-        assertTrue("x in crop ${eyesInCrop(r).x}", eyesInCrop(r).x < 0.5f)
-        assertTrue(r.plan.reason, r.plan.reason.contains("朝右看"))
-    }
-
-    @Test
-    fun fullBodyCropKeepsFeetAndHead() {
-        val r = settle(person(fullBody = true))
-        val s = r.frameSubject!!
-        assertEquals(ShotType.FULL_BODY, s.shot)
-        assertTrue(s.feetY!! <= r.plan.rect.bottom + 1e-3f)
-        assertTrue(s.headTop!! >= r.plan.rect.top - 1e-3f)
-        assertTrue(r.tips.none { it.id == "comp.headcut" || it.id == "comp.feetcut" })
-    }
-
-    @Test
-    fun cropBottomAvoidsKnees() {
-        val r = settle(person(fullBody = false), CropChoice.SQUARE)
-        for (j in r.frameSubject!!.joints) assertTrue(kotlin.math.abs(r.plan.rect.bottom - j) >= 0.035f)
-    }
-
-    @Test
-    fun cropStaysPutWhileSubjectJitters() {
-        val t = CompositionTracker()
-        var r = t.feed(0, person(fullBody = false))
-        repeat(30) { r = t.feed(100L * (it + 1), person(fullBody = false)) }
-        val settled = r.plan.rect
-        for ((i, dx) in listOf(0.01f, -0.01f, 0.008f, -0.006f, 0.01f).withIndex()) {
-            r = t.feed(4000L + i * 100, person(dx = dx, fullBody = false))
-            assertEquals(settled.left, r.plan.rect.left, 0.02f)
-            assertEquals(settled.top, r.plan.rect.top, 0.02f)
-        }
-    }
-
-    @Test
-    fun noCropWhenTurnedOff() {
-        val r = settle(person(fullBody = false), CropChoice.OFF)
-        assertEquals(RectN(0f, 0f, 1f, 1f), r.plan.rect)
-        assertEquals("", r.plan.reason)
-    }
-
-    @Test
-    fun squareCropHasSquareShape() {
-        val r = settle(person(fullBody = false), CropChoice.SQUARE)
-        // In pixels: width * frameAspect == height for a square.
-        assertEquals(r.plan.rect.height, r.plan.rect.width * portrait, 0.01f)
-    }
-
-    @Test
-    fun subjectAtEdgeAsksToMoveThePhone() {
-        // Close-up at the far right: even the best crop cannot put the eyes on a third.
-        val r = settle(person(dx = 0.45f, fullBody = false))
-        val tip = r.tips.firstOrNull { it.id == "comp.room" }
-        assertNotNull(tip)
-        assertTrue(tip!!.text, tip.text.startsWith("手机"))
-    }
+    /** The pose as seen after zooming in by [k] around the frame centre. */
+    private fun PoseFrame.zoomed(k: Float) =
+        PoseFrame(landmarks.map { it.copy(x = 0.5f + (it.x - 0.5f) * k, y = 0.5f + (it.y - 0.5f) * k) }, aspect)
 
     @Test
     fun displayToSourceInvertsRotationAndMirror() {
@@ -150,14 +90,6 @@ class GuidanceTest {
         assertEquals(RectN(0.2f, 0.5f, 0.6f, 0.9f), displayToSource(r, 90, false))
         // Mirrored first: x → 1 - x.
         assertEquals(RectN(0.5f, 0.2f, 0.9f, 0.6f), displayToSource(r, 0, true))
-    }
-
-    @Test
-    fun tiltedPhoneAsksToRaiseTheLowSide() {
-        val tips = CompositionRules.levelTips(LevelState(5f, false, 0f, 0f))
-        assertEquals(1, tips.size)
-        assertTrue(tips[0].text.contains("右侧抬高"))
-        assertTrue(CompositionRules.levelTips(LevelState(1f, false, 0f, 0f)).isEmpty())
     }
 
     @Test
@@ -216,44 +148,9 @@ class GuidanceTest {
         assertTrue(s.update(1400, emptyList()).isEmpty())
     }
 
-    private fun goodLight() = LightingAnalyzer.analyze(LumaGrid(4, 4, IntArray(16) { 130 }, 130f, 130f, 130f), null)
-
-    private fun checks(pose: PoseFrame?, lvl: LevelState = level): List<Check> {
-        val comp = if (pose == null) CompositionTracker().feed(0, null) else settle(pose)
-        return Checklist.build(comp, emptyList(), goodLight(), lvl, pose, PoseCoach.analyze(pose))
-    }
-
-    @Test
-    fun emptyFrameFailsTheSubjectCheck() {
-        val c = checks(null)
-        assertEquals(Check(false, "没找到主体"), c.first())
-    }
-
-    @Test
-    fun checksNameConcreteProblems() {
-        val p = person(fullBody = false, shoulderTilt = 0.05f)
-        val c = checks(p, LevelState(6f, false, 0f, 0f))
-        assertTrue(c.contains(Check(false, "歪了6°")))
-        assertTrue(c.contains(Check(true, "曝光正常")))
-        assertTrue(c.any { !it.ok && it.text == "肩不平" })
-        assertTrue(c.contains(Check(true, "人物完整")))
-    }
-
     /** Bright sky above row [edge], dark ground below. */
     private fun skyGrid(edge: Int, w: Int = 16, h: Int = 24) =
         LumaGrid(w, h, IntArray(w * h) { if (it / w < edge) 210 else 70 }, 150f, 150f, 150f)
-
-    @Test
-    fun horizonFoundAndGuidedToAThird() {
-        val g = skyGrid(12)
-        val y = HorizonDetector.detect(g)
-        assertNotNull(y)
-        assertEquals(0.5f, y!!, 0.05f)
-        val subject = SubjectPicker.pick(null, emptyList(), g)!!
-        assertEquals(SubjectKind.HORIZON, subject.kind)
-        val r = CompositionTracker().update(0, subject, null, level, GridMode.THIRDS, portrait, portrait)
-        assertTrue(r.plan.reason, r.plan.reason.contains("地平线"))
-    }
 
     @Test
     fun flatFrameHasNoHorizon() {
@@ -272,20 +169,6 @@ class GuidanceTest {
     }
 
     @Test
-    fun objectAdviceNamesTheObjectAndMovesThePhone() {
-        val s = SubjectPicker.pick(null, listOf(ObjectBox("cup", 0.8f, RectN(0.75f, 0.1f, 0.9f, 0.25f))), null)!!
-        val r = CompositionTracker().update(0, s, null, level, GridMode.THIRDS, portrait, portrait)
-        assertTrue(r.plan.reason, r.plan.reason.contains("杯子"))
-        // The whole cup stays inside the crop.
-        val c = r.plan.rect
-        assertTrue(c.left <= 0.75f + 1e-3f && c.right >= 0.9f - 1e-3f && c.top <= 0.1f + 1e-3f && c.bottom >= 0.25f - 1e-3f)
-        // Held upright over food → suggest a higher angle.
-        val tips = SceneAdvisor.tips(s, LevelState(0f, false, 0f, 90f, pitchDeg = 5f))
-        assertTrue(tips.any { it.id == "scene.food.angle" })
-        assertEquals("美食 · 杯子", SceneAdvisor.describe(s, null, null))
-    }
-
-    @Test
     fun sharpnessSeparatesEdgesFromFlat() {
         val w = 64
         val h = 64
@@ -293,5 +176,154 @@ class GuidanceTest {
         val flat = IntArray(w * h) { 128 }
         assertTrue(Sharpness.laplacianVariance(checker, w, h) > Sharpness.BLURRY_BELOW)
         assertTrue(Sharpness.laplacianVariance(flat, w, h) < Sharpness.BLURRY_BELOW)
+    }
+
+    @Test
+    fun recommendationWaitsForTheSubjectToSettle() {
+        val t = CompositionTracker()
+        assertEquals(AimPhase.IDLE, t.feed(0, person(fullBody = false)).aim.phase)
+        val r = t.run(person(fullBody = false), start = 100, frames = 5)
+        assertEquals(AimPhase.GUIDE, r.aim.phase)
+        assertNotNull(r.aim.target)
+        assertTrue(r.aim.hint, r.aim.hint.contains("圆点"))
+    }
+
+    @Test
+    fun targetIsFixedToTheSceneAndMovesWithIt() {
+        val t = CompositionTracker()
+        val p = person(fullBody = false)
+        val before = t.run(p).aim.target!!
+        // Panning the phone moves everything in the frame; the target must move by the same amount.
+        val after = t.run(p.shifted(0.1f, 0.05f), start = 2000, frames = 15).aim.target!!
+        assertEquals(before.x + 0.1f, after.x, 0.01f)
+        assertEquals(before.y + 0.05f, after.y, 0.01f)
+    }
+
+    @Test
+    fun recommendationDoesNotJumpWithJitter() {
+        val t = CompositionTracker()
+        val p = person(fullBody = false)
+        var r = t.run(p)
+        val offset = r.aim.target!!.x - r.frameSubject!!.anchor.x
+        for ((i, dx) in listOf(0.01f, -0.012f, 0.008f, -0.01f, 0.012f).withIndex()) {
+            r = t.feed(2000L + i * 100, p.shifted(dx, 0f))
+            assertEquals(offset, r.aim.target!!.x - r.frameSubject!!.anchor.x, 1e-4f)
+        }
+    }
+
+    @Test
+    fun aimHoldZoomDone() {
+        val t = CompositionTracker()
+        val p = person(fullBody = false)
+        val target = t.run(p).aim.target!!
+        // Point the phone so the target is in the centre ring.
+        val aimed = p.shifted(0.5f - target.x, 0.5f - target.y)
+        var r = t.run(aimed, start = 2000, frames = 12)
+        assertTrue("phase ${r.aim.phase}", r.aim.phase == AimPhase.HOLD || r.aim.phase == AimPhase.ZOOM || r.aim.phase == AimPhase.DONE)
+        r = t.run(aimed, start = 4000, frames = 6)
+        assertEquals(AimPhase.ZOOM, r.aim.phase)
+        val zoom = r.aim.zoomTo!!
+        assertTrue("zoom $zoom", zoom > 1.05f && zoom <= 3f)
+        // After the camera zooms in, the scene is magnified around the centre.
+        r = t.run(aimed.zoomed(zoom), aimInput(zoom = zoom), start = 6000, frames = 3)
+        assertEquals(AimPhase.DONE, r.aim.phase)
+        assertTrue(r.aim.reason, r.aim.reason.contains("拉近"))
+    }
+
+    @Test
+    fun peopleInSceneStyleNeverZooms() {
+        val t = CompositionTracker()
+        val input = aimInput(style = PortraitStyle.SCENE)
+        val p = person(fullBody = false)
+        val target = t.run(p, input).aim.target!!
+        val aimed = p.shifted(0.5f - target.x, 0.5f - target.y)
+        val r = t.run(aimed, input, start = 2000, frames = 20)
+        assertEquals(AimPhase.DONE, r.aim.phase)
+        assertFalse(r.aim.reason, r.aim.reason.contains("拉近"))
+    }
+
+    @Test
+    fun personLookingRightGetsRoomAhead() {
+        val r = CompositionTracker().run(person(fullBody = false, lookRight = true))
+        assertEquals(1, r.frameSubject!!.facing)
+        // The recommended view centre is to the right of the person: space ahead of their gaze.
+        assertTrue(r.aim.target!!.x > r.frameSubject!!.anchor.x)
+        assertTrue(r.aim.reason, r.aim.reason.contains("朝右看"))
+    }
+
+    @Test
+    fun fullBodyAsksForASlightlyLowAngleFirst() {
+        // Camera looking 10° down at a full-body shot.
+        val r = CompositionTracker().run(person(fullBody = true), aimInput(pitch = 10f))
+        assertEquals(AimPhase.ANGLE, r.aim.phase)
+        assertTrue(r.aim.angle!!.offsetDeg > 0f)
+        assertTrue(r.aim.hint, r.aim.hint.contains("仰"))
+        // At the right angle the assistant moves on to aiming.
+        val ok = CompositionTracker().run(person(fullBody = true), aimInput(pitch = -6f), frames = 15)
+        assertTrue("phase ${ok.aim.phase}", ok.aim.phase != AimPhase.ANGLE)
+    }
+
+    @Test
+    fun frontCameraSkipsAngleAdvice() {
+        val r = CompositionTracker().run(person(fullBody = true), aimInput(pitch = 20f, front = true))
+        assertTrue(r.aim.phase != AimPhase.ANGLE)
+    }
+
+    @Test
+    fun nothingToAimAtWithoutASubject() {
+        val r = CompositionTracker().feed(0, null)
+        assertEquals(AimPhase.IDLE, r.aim.phase)
+        assertNull(r.aim.target)
+    }
+
+    @Test
+    fun noRecommendationWhileThePhoneMoves() {
+        val r = CompositionTracker().run(person(fullBody = false), aimInput(steady = false))
+        assertEquals(AimPhase.IDLE, r.aim.phase)
+    }
+
+    @Test
+    fun horizonIsAimedToAThirdLine() {
+        val g = skyGrid(12)
+        val y = HorizonDetector.detect(g)
+        assertNotNull(y)
+        assertEquals(0.5f, y!!, 0.05f)
+        val subject = SubjectPicker.pick(null, emptyList(), g)!!
+        assertEquals(SubjectKind.HORIZON, subject.kind)
+        val t = CompositionTracker()
+        var r = t.update(0, subject, null, aimInput())
+        for (i in 1..6) r = t.update(i * 100L, subject, null, aimInput())
+        assertTrue(r.aim.reason, r.aim.reason.contains("地平线"))
+        // The target sits a third away from the horizon: centred horizontally.
+        assertEquals(0.5f, r.aim.target!!.x, 1e-3f)
+    }
+
+    @Test
+    fun objectRecommendationNamesTheObject() {
+        val s = SubjectPicker.pick(null, listOf(ObjectBox("cup", 0.8f, RectN(0.6f, 0.1f, 0.75f, 0.25f))), null)!!
+        val t = CompositionTracker()
+        // Food is shot at about 45°; held upright the assistant asks for that first.
+        assertEquals(AimPhase.ANGLE, t.update(0, s, null, aimInput()).aim.phase)
+        val tilted = aimInput(pitch = 45f)
+        var r = t.update(100, s, null, tilted)
+        for (i in 2..12) r = t.update(i * 100L, s, null, tilted)
+        assertTrue(r.aim.reason, r.aim.reason.contains("杯子"))
+        assertEquals("美食 · 杯子", SceneAdvisor.describe(s, null, null))
+    }
+
+    private fun goodLight() = LightingAnalyzer.analyze(LumaGrid(4, 4, IntArray(16) { 130 }, 130f, 130f, 130f), null)
+
+    @Test
+    fun checksNameConcreteProblems() {
+        val p = person(fullBody = false, shoulderTilt = 0.05f)
+        val comp = CompositionTracker().run(p)
+        val c = Checklist.build(comp, goodLight(), LevelState(6f, false, 0f, 0f), p, PoseCoach.analyze(p))
+        assertTrue(c.contains(Check(false, "构图没对准")))
+        assertTrue(c.contains(Check(false, "歪了6°")))
+        assertTrue(c.contains(Check(true, "曝光正常")))
+        assertTrue(c.any { !it.ok && it.text == "肩不平" })
+        assertTrue(c.contains(Check(true, "人物完整")))
+        val empty = Checklist.build(CompositionTracker().feed(0, null), goodLight(), level, null, emptyList())
+        assertEquals(Check(false, "没找到主体"), empty.first())
     }
 }

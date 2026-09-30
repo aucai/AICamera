@@ -31,6 +31,7 @@ data class FrameSubject(
     val joints: List<Float> = emptyList(),
     val facing: Int = 0,
     val group: ObjectGroup? = null,
+    val shoulderY: Float? = null,
 ) {
     companion object {
         fun from(subject: Subject, pose: PoseFrame?, shot: ShotType?, anchor: Vec2): FrameSubject {
@@ -59,6 +60,7 @@ data class FrameSubject(
             } else null
             return FrameSubject(
                 SubjectKind.PERSON, subject.label, anchor, extent, shot, headTop, feet, joints, facing(pose),
+                shoulderY = pose.shoulderMid.y,
             )
         }
 
@@ -100,12 +102,26 @@ data class FramingCandidate(
 )
 
 /**
- * Picks the crop that best composes the subject: tries every combination of rule point and zoom level,
- * scores each crop on placement, not cutting heads/feet/joints, filling the frame and keeping resolution.
+ * How much the planner may change the view.
+ * @property scales view sizes to try, as a fraction of the current view (0.5 = zoom in 2x).
+ * @property clamp keep the view inside the current frame (cropping) or let it move (the phone will pan).
+ * @property zoomCost how much each step of zoom is discouraged.
+ * @property closeUp for people: prefer framing head to waist.
+ */
+data class FramingOptions(
+    val scales: FloatArray = floatArrayOf(1f, 0.9f, 0.8f, 0.7f, 0.6f),
+    val clamp: Boolean = true,
+    val zoomCost: Float = 0.6f,
+    val closeUp: Boolean = false,
+)
+
+/**
+ * Picks the view that best composes the subject: tries every combination of rule point and zoom level,
+ * scores each on placement, not cutting heads/feet/joints, filling the frame and keeping resolution.
  */
 object FramingPlanner {
 
-    val SCALES = floatArrayOf(1f, 0.9f, 0.8f, 0.7f, 0.6f)
+    val SCALES = FramingOptions().scales
 
     /** Crop width/height (normalized to the frame) for an output aspect ratio at a zoom scale. */
     fun cropSize(frameAspect: Float, outAspect: Float, scale: Float): Pair<Float, Float> {
@@ -139,21 +155,27 @@ object FramingPlanner {
         SubjectKind.HORIZON -> ys(rule).map { null to it }
     }
 
-    fun candidates(s: FrameSubject, frameAspect: Float, outAspect: Float, rule: GridMode): List<FramingCandidate> {
+    fun candidates(
+        s: FrameSubject,
+        frameAspect: Float,
+        outAspect: Float,
+        rule: GridMode,
+        options: FramingOptions = FramingOptions(),
+    ): List<FramingCandidate> {
         val out = ArrayList<FramingCandidate>()
-        for (scale in SCALES) {
+        for (scale in options.scales) {
             val (cw, ch) = cropSize(frameAspect, outAspect, scale)
             for ((tx, ty) in targets(s, rule)) {
                 val config = FramingConfig(tx, ty, scale)
-                val (rect, overflow) = rectFor(s, config, cw, ch)
-                out += FramingCandidate(config, rect, cost(s, rect, config), overflow)
+                val (rect, overflow) = rectFor(s, config, cw, ch, options.clamp)
+                out += FramingCandidate(config, rect, cost(s, rect, config, options), overflow)
             }
         }
         return out
     }
 
     /** The crop for a config, clamped into the frame, plus how far it had to be pushed back in. */
-    fun rectFor(s: FrameSubject, c: FramingConfig, cw: Float, ch: Float): Pair<RectN, FloatArray> {
+    fun rectFor(s: FrameSubject, c: FramingConfig, cw: Float, ch: Float, clamp: Boolean = true): Pair<RectN, FloatArray> {
         val left = if (c.tx != null) s.anchor.x - c.tx * cw else 0.5f - cw / 2f
         val top = when {
             s.kind == SubjectKind.PERSON && s.shot == ShotType.FULL_BODY && s.feetY != null -> s.feetY - 0.95f * ch
@@ -161,12 +183,13 @@ object FramingPlanner {
             else -> 0.5f - ch / 2f
         }
         val overflow = floatArrayOf(max(0f, -left), max(0f, -top), max(0f, left + cw - 1f), max(0f, top + ch - 1f))
+        if (!clamp) return RectN(left, top, left + cw, top + ch) to overflow
         val l = left.coerceIn(0f, max(0f, 1f - cw))
         val t = top.coerceIn(0f, max(0f, 1f - ch))
         return RectN(l, t, l + cw, t + ch) to overflow
     }
 
-    fun cost(s: FrameSubject, r: RectN, c: FramingConfig): Float {
+    fun cost(s: FrameSubject, r: RectN, c: FramingConfig, options: FramingOptions = FramingOptions()): Float {
         var cost = 0f
         val ax = (s.anchor.x - r.left) / r.width
         val ay = (s.anchor.y - r.top) / r.height
@@ -197,6 +220,11 @@ object FramingPlanner {
                     cost += if (roomAhead) -0.3f else 0.4f
                 }
                 if (c.tx == 0.5f) cost += if (s.facing == 0) 0.05f else 0.3f
+                if (options.closeUp && s.headTop != null && s.shoulderY != null && s.shot != ShotType.FULL_BODY) {
+                    // Head to waist is about three head-to-shoulder lengths.
+                    val want = (s.shoulderY - s.headTop) * 3.2f
+                    if (want > 0.02f) cost += 2f * abs(r.height / want - 1f)
+                }
             }
             SubjectKind.OBJECT -> {
                 s.extent?.let { b ->
@@ -213,8 +241,14 @@ object FramingPlanner {
             }
             SubjectKind.HORIZON -> Unit
         }
-        // Every crop costs resolution; only crop when it clearly helps.
-        cost += 0.6f * (1f - c.scale)
+        // Every zoom step costs resolution and context; only zoom when it clearly helps.
+        cost += options.zoomCost * (1f - c.scale)
+        if (!options.clamp) {
+            // Do not ask the user to swing the phone far away from what they are pointing at.
+            val dx = r.center.x - 0.5f
+            val dy = r.center.y - 0.5f
+            cost += 3f * max(0f, kotlin.math.sqrt(dx * dx + dy * dy) - 0.3f)
+        }
         return cost
     }
 
@@ -225,7 +259,7 @@ object FramingPlanner {
             0.5f -> "画面正中"
             else -> if (c.tx < 0.5f) "左侧三分线" else "右侧三分线"
         }
-        val zoom = if (c.scale < 0.99f) "，放大 %.1f 倍".format(1f / c.scale) else ""
+        val zoom = if (c.scale < 0.99f) "，拉近到 %.1f 倍".format(1f / c.scale) else ""
         val text = when (s.kind) {
             SubjectKind.PERSON -> when {
                 s.shot == ShotType.FULL_BODY -> "全身：人物在$side，脚底贴近底边"
@@ -247,108 +281,14 @@ object FramingPlanner {
  * @property rect smoothed crop, what is drawn now.
  * @property reason why the camera framed it this way.
  */
-data class FramingPlan(
-    val rect: RectN,
-    val reason: String,
-    val config: FramingConfig?,
-    val overflow: FloatArray,
-)
-
-/**
- * Keeps the crop calm: the chosen rule point / zoom only changes when another option is clearly
- * better for several frames in a row, and the rectangle glides to its new place instead of jumping.
- */
-class FramingTracker(
-    private val switchMargin: Float = 0.25f,
-    private val switchFrames: Int = 4,
-    private val glide: Float = 0.3f,
-) {
-    private var config: FramingConfig? = null
-    private var pending: FramingConfig? = null
-    private var pendingCount = 0
-    private var rect: RectN? = null
-
-    fun reset() {
-        config = null
-        pending = null
-        pendingCount = 0
-        rect = null
-    }
-
-    fun update(s: FrameSubject?, frameAspect: Float, outAspect: Float?, rule: GridMode): FramingPlan {
-        if (outAspect == null) {
-            reset()
-            return FramingPlan(RectN(0f, 0f, 1f, 1f), "", null, FloatArray(4))
-        }
-        if (s == null) {
-            config = null
-            val (cw, ch) = FramingPlanner.cropSize(frameAspect, outAspect, 1f)
-            val target = RectN(0.5f - cw / 2f, 0.5f - ch / 2f, 0.5f + cw / 2f, 0.5f + ch / 2f)
-            return FramingPlan(glideTo(target), "没找到主体，保持原画面", null, FloatArray(4))
-        }
-        val candidates = FramingPlanner.candidates(s, frameAspect, outAspect, rule)
-        val best = candidates.minBy { it.cost }
-        val current = candidates.firstOrNull { it.config == config }
-        val chosen = when {
-            current == null -> best
-            best.cost + switchMargin < current.cost -> {
-                if (pending == best.config) pendingCount++ else {
-                    pending = best.config
-                    pendingCount = 1
-                }
-                if (pendingCount >= switchFrames) best else current
-            }
-            else -> {
-                pending = null
-                pendingCount = 0
-                current
-            }
-        }
-        if (chosen.config != config) {
-            pending = null
-            pendingCount = 0
-        }
-        config = chosen.config
-        return FramingPlan(glideTo(chosen.rect), FramingPlanner.reason(s, chosen.config), chosen.config, chosen.overflow)
-    }
-
-    private fun glideTo(target: RectN): RectN {
-        val prev = rect
-        val next = if (prev == null) target else RectN(
-            prev.left + glide * (target.left - prev.left),
-            prev.top + glide * (target.top - prev.top),
-            prev.right + glide * (target.right - prev.right),
-            prev.bottom + glide * (target.bottom - prev.bottom),
-        )
-        rect = next
-        return next
-    }
-}
-
 data class CompositionResult(
     val subject: Subject?,
     val frameSubject: FrameSubject?,
     val shot: ShotType?,
-    val plan: FramingPlan,
-    val tips: List<Tip>,
+    val aim: AimState,
 )
 
 object CompositionRules {
-
-    fun levelTips(level: LevelState): List<Tip> {
-        if (level.flat) {
-            val tilt = maxOf(abs(level.tiltX), abs(level.tiltY))
-            return if (tilt > 3f) {
-                listOf(Tip("level.flat", TipCategory.LEVEL, Severity.SUGGEST, "俯拍时把手机放平（偏了%.0f°）".format(tilt)))
-            } else emptyList()
-        }
-        val roll = level.rollDeg
-        if (abs(roll) <= 2.5f) return emptyList()
-        val severity = if (abs(roll) > 6f) Severity.WARNING else Severity.SUGGEST
-        // Rotated clockwise → the right side dropped → raise the right side.
-        val side = if (roll > 0) "右" else "左"
-        return listOf(Tip("level.roll", TipCategory.LEVEL, severity, "手机${side}侧抬高一点（歪了%.0f°）".format(abs(roll))))
-    }
 
     fun anchorOf(pose: PoseFrame, shot: ShotType): Vec2 {
         val eyes = pose.eyes
@@ -357,56 +297,34 @@ object CompositionRules {
         return Vec2(bodyX, eyes.y)
     }
 
-    /**
-     * Problems the crop cannot fix, so the phone has to move: the subject is too close to an edge
-     * for the chosen framing, or a head, feet or joint would still be cut.
-     */
-    fun framingTips(s: FrameSubject, plan: FramingPlan, cropping: Boolean): List<Tip> {
-        val tips = ArrayList<Tip>()
-        val r = plan.rect
-        if (s.kind == SubjectKind.PERSON) {
-            val head = s.headTop
-            if (head != null && s.shot != ShotType.CLOSE_UP && head < r.top + 0.005f) {
-                tips += Tip("comp.headcut", TipCategory.COMPOSITION, Severity.WARNING, "头顶被切了，手机往上抬一点")
-            }
-            val feet = s.feetY
-            if (s.shot == ShotType.FULL_BODY && feet != null && feet > r.bottom + 0.01f) {
-                tips += Tip("comp.feetcut", TipCategory.COMPOSITION, Severity.WARNING, "脚被切了，手机往下放一点")
-            }
-            if (s.joints.any { abs(r.bottom - it) < 0.035f }) {
-                tips += Tip("comp.jointcut", TipCategory.COMPOSITION, Severity.WARNING, "底边切在膝盖或脚踝上了，手机往下移拍全身，或往上移只拍到大腿")
-            }
-            if (s.shot == ShotType.FULL_BODY && s.headTop != null && s.feetY != null && (s.feetY - s.headTop) / r.height < 0.4f) {
-                tips += Tip("comp.small", TipCategory.COMPOSITION, Severity.SUGGEST, "人太小了，拿着手机走近一点")
-            }
+    /** Parts of a person cut off by the frame edges, for the photo review. */
+    fun completenessIssues(s: FrameSubject): List<String> {
+        if (s.kind != SubjectKind.PERSON) {
+            val b = s.extent ?: return emptyList()
+            val touches = b.left < 0.01f || b.top < 0.01f || b.right > 0.99f || b.bottom > 0.99f
+            return if (touches && b.width * b.height < 0.6f) listOf("主体被切") else emptyList()
         }
-        if (cropping && plan.config != null) {
-            val o = plan.overflow
-            val worst = o.indices.maxBy { o[it] }
-            if (o[worst] > 0.05f) {
-                val text = when (worst) {
-                    0 -> "手机向左移一点，左边留点空间"
-                    1 -> if (s.kind == SubjectKind.PERSON) "手机往上抬一点，头顶留点空间" else "手机往上抬一点，上面留点空间"
-                    2 -> "手机向右移一点，右边留点空间"
-                    else -> "手机往下放一点，下面留点空间"
-                }
-                tips += Tip("comp.room", TipCategory.COMPOSITION, Severity.SUGGEST, text)
-            }
-        }
-        return tips
+        val out = ArrayList<String>()
+        val head = s.headTop
+        if (head != null && s.shot != ShotType.CLOSE_UP && head < 0.005f) out += "头顶被切"
+        val feet = s.feetY
+        if (s.shot == ShotType.FULL_BODY && feet != null && feet > 1.01f) out += "脚被切"
+        if (s.joints.any { abs(1f - it) < 0.035f }) out += "切到关节"
+        return out
     }
 }
 
 /**
- * Tracks the subject across frames and plans the crop:
+ * Tracks the subject across frames and runs the aiming assistant on it:
  * - a missed detection keeps the last subject for a moment instead of dropping everything;
- * - the subject position is smoothed; the shot type only changes after several frames.
+ * - the subject position is smoothed; the shot type only changes after several frames;
+ * - a new subject starts a new recommendation.
  */
 class CompositionTracker(
     private val smoothing: Float = 0.35f,
     private val lostResetMs: Long = 1500,
 ) {
-    private val framing = FramingTracker()
+    val aim = AimAssist()
     private var subject: Subject? = null
     private var anchor: Vec2? = null
     private var shot: ShotType? = null
@@ -417,7 +335,7 @@ class CompositionTracker(
     val currentSubject get() = subject
 
     fun reset() {
-        framing.reset()
+        aim.reset()
         subject = null
         anchor = null
         shot = null
@@ -425,29 +343,18 @@ class CompositionTracker(
         pendingCount = 0
     }
 
-    fun update(
-        nowMs: Long,
-        subjectNow: Subject?,
-        pose: PoseFrame?,
-        level: LevelState?,
-        grid: GridMode,
-        frameAspect: Float,
-        outAspect: Float?,
-    ): CompositionResult {
-        val tips = ArrayList<Tip>()
-        level?.let { tips += CompositionRules.levelTips(it) }
-
+    fun update(nowMs: Long, subjectNow: Subject?, pose: PoseFrame?, input: AimInput): CompositionResult {
         val held = subject?.takeIf { nowMs - lastSeenMs <= lostResetMs }
         val subject = subjectNow ?: held
         if (subjectNow != null) lastSeenMs = nowMs
         if (subject == null || (subjectNow != null && held != null && !sameSubject(held, subjectNow))) {
             anchor = null
             shot = null
+            aim.reset()
         }
         this.subject = subject
         if (subject == null) {
-            val plan = framing.update(null, frameAspect, outAspect, grid)
-            return CompositionResult(null, null, null, plan, tips)
+            return CompositionResult(null, null, null, aim.update(nowMs, null, input))
         }
 
         val livePose = pose?.takeIf { it.hasShoulders && subject.kind == SubjectKind.PERSON }
@@ -462,9 +369,8 @@ class CompositionTracker(
         anchor = a
 
         val fs = FrameSubject.from(subject, livePose, shot, a)
-        val plan = framing.update(fs, frameAspect, outAspect, grid)
-        tips += CompositionRules.framingTips(fs, plan, cropping = outAspect != null)
-        return CompositionResult(subject, fs, if (subject.kind == SubjectKind.PERSON) shot else null, plan, tips)
+        val state = aim.update(nowMs, fs, input)
+        return CompositionResult(subject, fs, if (subject.kind == SubjectKind.PERSON) shot else null, state)
     }
 
     private fun sameSubject(a: Subject, b: Subject): Boolean {
@@ -505,24 +411,3 @@ fun iou(a: RectN, b: RectN): Float {
     return if (union <= 0f) 0f else inter / union
 }
 
-/** Output aspect for the auto-crop. TALL is 9:16 when the phone is upright and 16:9 when it is sideways. */
-enum class CropChoice {
-    SAME,
-    SQUARE,
-    TALL,
-    OFF;
-
-    fun aspect(frameAspect: Float): Float? = when (this) {
-        SAME -> frameAspect
-        SQUARE -> 1f
-        TALL -> if (frameAspect < 1f) 9f / 16f else 16f / 9f
-        OFF -> null
-    }
-
-    fun label(portrait: Boolean): String = when (this) {
-        SAME -> if (portrait) "取景 3:4" else "取景 4:3"
-        SQUARE -> "取景 1:1"
-        TALL -> if (portrait) "取景 9:16" else "取景 16:9"
-        OFF -> "不裁剪"
-    }
-}
