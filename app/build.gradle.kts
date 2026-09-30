@@ -12,8 +12,9 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        // 64-bit ARM covers practically every phone that runs Android 10+.
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -30,7 +31,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("debug")
         }
     }
@@ -42,6 +44,13 @@ android {
 
     buildFeatures {
         viewBinding = true
+    }
+
+    // Compress native libraries to keep the download small.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     androidResources {
