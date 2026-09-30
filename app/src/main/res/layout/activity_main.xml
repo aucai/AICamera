@@ -112,6 +112,32 @@
         </LinearLayout>
 
         <LinearLayout
+            android:id="@+id/scoreRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingStart="8dp"
+            android:paddingTop="6dp"
+            android:paddingEnd="8dp">
+
+            <TextView
+                android:id="@+id/scoreComposition"
+                style="@style/ScorePill" />
+
+            <TextView
+                android:id="@+id/scoreLight"
+                style="@style/ScorePill" />
+
+            <TextView
+                android:id="@+id/scorePose"
+                style="@style/ScorePill" />
+
+            <TextView
+                android:id="@+id/scoreLevel"
+                style="@style/ScorePill" />
+        </LinearLayout>
+
+        <LinearLayout
             android:id="@+id/modeTabs"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -1,6 +1,7 @@
 package com.aucai.aicamera.core
 
 import kotlin.math.abs
+import kotlin.math.max
 
 enum class GridMode(val label: String) {
     THIRDS("九宫格"),
@@ -10,45 +11,23 @@ enum class GridMode(val label: String) {
 }
 
 /**
- * @property anchor where the subject currently is (eyes for close-ups, body centre otherwise).
- * @property target where the subject should go; null when there is no suggestion.
+ * @property anchor where the subject is now (smoothed): the eyes, or for full-body shots the body centre line.
+ * @property targetX where the anchor should go horizontally; null when no target is shown.
+ * @property targetY where the eyes should go vertically; null for full-body shots (they only get a vertical line).
+ * @property placementError normalised distance from anchor to target (measured against thirds when the grid is off).
  */
 data class CompositionResult(
     val anchor: Vec2?,
-    val target: Vec2?,
+    val targetX: Float?,
+    val targetY: Float?,
     val aligned: Boolean,
+    val placementError: Float?,
+    val shot: ShotType?,
     val tips: List<Tip>,
 )
 
-object CompositionAnalyzer {
-
-    private const val TOLERANCE = 0.06f
-
-    fun analyze(pose: PoseFrame?, level: LevelState?, grid: GridMode, frontCamera: Boolean): CompositionResult {
-        val tips = ArrayList<Tip>()
-        level?.let { tips += levelTips(it) }
-        if (pose == null || !pose.hasShoulders) {
-            return CompositionResult(null, null, false, tips)
-        }
-
-        val shot = pose.shotType
-        val eyes = pose.eyes
-        val bodyX = if (pose.hasHips) (pose.shoulderMid.x + pose.hipMid.x) / 2f else pose.shoulderMid.x
-        val anchor = Vec2(if (shot == ShotType.CLOSE_UP) eyes.x else bodyX, eyes.y)
-
-        var target: Vec2? = null
-        var aligned = false
-        targetFor(grid, shot, anchor)?.let { t ->
-            target = t
-            val dx = t.x - anchor.x
-            val dy = t.y - anchor.y
-            aligned = abs(dx) < TOLERANCE && abs(dy) < TOLERANCE
-            placementTip(dx, dy, frontCamera, grid)?.let { tips += it }
-        }
-
-        tips += framingTips(pose, shot)
-        return CompositionResult(anchor, target, aligned, tips)
-    }
+/** Stateless composition rules. All advice is phrased as how to move the phone. */
+object CompositionRules {
 
     fun levelTips(level: LevelState): List<Tip> {
         if (level.flat) {
@@ -65,50 +44,54 @@ object CompositionAnalyzer {
         return listOf(Tip("level.roll", TipCategory.LEVEL, severity, "手机${side}侧抬高一点（歪了%.0f°）".format(abs(roll))))
     }
 
-    /** Nearest power point for the anchor. Full-body shots only get a horizontal target. */
-    fun targetFor(grid: GridMode, shot: ShotType, anchor: Vec2): Vec2? {
-        val (xs, y) = when (grid) {
-            GridMode.OFF -> return null
-            GridMode.THIRDS -> listOf(1f / 3f, 2f / 3f) to 1f / 3f
-            GridMode.GOLDEN -> listOf(0.382f, 0.618f) to 0.382f
-            GridMode.CENTER -> listOf(0.5f) to 1f / 3f
-        }
-        // Close-ups also read well centred.
-        val candidates = if (shot == ShotType.CLOSE_UP && grid != GridMode.CENTER) xs + 0.5f else xs
-        val tx = candidates.minBy { abs(it - anchor.x) }
-        val ty = if (shot == ShotType.FULL_BODY) anchor.y else y
-        return Vec2(tx, ty)
+    /** Candidate vertical lines. With the grid off, thirds are still used to score the shot. */
+    fun targetXs(grid: GridMode): List<Float> = when (grid) {
+        GridMode.THIRDS, GridMode.OFF -> listOf(1f / 3f, 2f / 3f)
+        GridMode.GOLDEN -> listOf(0.382f, 0.618f)
+        GridMode.CENTER -> listOf(0.5f)
     }
 
-    private fun placementTip(dx: Float, dy: Float, frontCamera: Boolean, grid: GridMode): Tip? {
-        if (abs(dx) < TOLERANCE && abs(dy) < TOLERANCE) return null
-        val goal = when (grid) {
-            GridMode.CENTER -> "画面中间"
-            GridMode.GOLDEN -> "黄金分割点"
-            else -> "三分点"
-        }
-        val text = if (abs(dx) >= abs(dy)) {
-            // dx > 0: the subject needs to move right in the frame.
-            if (frontCamera) {
-                if (dx > 0) "人往画面右边挪一点，落在${goal}上" else "人往画面左边挪一点，落在${goal}上"
-            } else {
-                if (dx > 0) "手机向左移一点，让人物落在${goal}上" else "手机向右移一点，让人物落在${goal}上"
-            }
+    /** Where the eyes should sit. Full-body shots have no vertical target. */
+    fun targetY(grid: GridMode, shot: ShotType): Float? = when {
+        shot == ShotType.FULL_BODY -> null
+        grid == GridMode.GOLDEN -> 0.382f
+        else -> 1f / 3f
+    }
+
+    fun anchorOf(pose: PoseFrame, shot: ShotType): Vec2 {
+        val eyes = pose.eyes
+        if (shot == ShotType.CLOSE_UP) return eyes
+        val bodyX = if (pose.hasHips) (pose.shoulderMid.x + pose.hipMid.x) / 2f else pose.shoulderMid.x
+        return Vec2(bodyX, eyes.y)
+    }
+
+    /**
+     * dx > 0: the subject has to move right in the frame, i.e. move the phone left.
+     * dy > 0: the eyes have to move down in the frame, i.e. raise the phone.
+     */
+    fun placementTip(dx: Float, dy: Float, grid: GridMode, fullBody: Boolean): Tip {
+        val move = if (abs(dx) >= abs(dy)) {
+            if (dx > 0) "手机向左移一点" else "手机向右移一点"
         } else {
-            // dy > 0: the eyes need to move down in the frame, i.e. raise the phone.
-            if (dy > 0) "手机往上抬一点，眼睛放在上三分线" else "手机往下放一点，眼睛放在上三分线"
+            if (dy > 0) "手机往上抬一点" else "手机往下放一点"
         }
-        return Tip("comp.place", TipCategory.COMPOSITION, Severity.SUGGEST, text)
+        val goal = when {
+            grid == GridMode.CENTER -> "让人在画面正中"
+            fullBody -> "让人落在竖线上"
+            grid == GridMode.GOLDEN -> "让眼睛落在黄金分割点"
+            else -> "让眼睛落在三分点"
+        }
+        return Tip("comp.place", TipCategory.COMPOSITION, Severity.SUGGEST, "$move，$goal")
     }
 
-    private fun framingTips(pose: PoseFrame, shot: ShotType): List<Tip> {
+    fun framingTips(pose: PoseFrame, shot: ShotType): List<Tip> {
         val tips = ArrayList<Tip>()
         val headTop = pose.headTop
         if (headTop != null && shot != ShotType.CLOSE_UP) {
             if (headTop < 0.01f) {
-                tips += Tip("comp.headcut", TipCategory.COMPOSITION, Severity.WARNING, "头顶被切掉了，手机往上抬一点")
+                tips += Tip("comp.headcut", TipCategory.COMPOSITION, Severity.WARNING, "头顶被切了，手机往上抬一点")
             } else if (shot == ShotType.HALF_BODY && headTop > 0.28f) {
-                tips += Tip("comp.headroom", TipCategory.COMPOSITION, Severity.SUGGEST, "头顶留白太多，手机往下放一点")
+                tips += Tip("comp.headroom", TipCategory.COMPOSITION, Severity.SUGGEST, "头顶空太多，手机往下放一点")
             }
         }
 
@@ -119,20 +102,125 @@ object CompositionAnalyzer {
             pose.visible(it, 0.4f) && pose.landmarks[it].y in 0.95f..1.05f
         }
         when {
-            kneeCut -> tips += Tip("comp.jointcut", TipCategory.COMPOSITION, Severity.WARNING, "底边正好切在膝盖，拍全身或者只拍到大腿")
-            ankleCut -> tips += Tip("comp.jointcut", TipCategory.COMPOSITION, Severity.WARNING, "底边切到脚踝了，把脚完整拍进来")
+            kneeCut -> tips += Tip("comp.jointcut", TipCategory.COMPOSITION, Severity.WARNING, "底边切在膝盖了，手机往下移拍全身，或往上移只拍到大腿")
+            ankleCut -> tips += Tip("comp.jointcut", TipCategory.COMPOSITION, Severity.WARNING, "底边切到脚踝了，手机往下移一点把脚拍全")
         }
 
         if (shot == ShotType.FULL_BODY) {
             val feet = maxOf(pose.landmarks[PoseIdx.LEFT_ANKLE].y, pose.landmarks[PoseIdx.RIGHT_ANKLE].y)
             if (feet < 0.85f) {
-                tips += Tip("comp.feet", TipCategory.COMPOSITION, Severity.SUGGEST, "镜头稍微上仰，让脚底贴近画面底边，更显腿长")
+                tips += Tip("comp.feet", TipCategory.COMPOSITION, Severity.SUGGEST, "镜头稍微往上仰，让脚底贴近画面底边，更显腿长")
             }
             val body = pose.bodyBounds()
             if (body != null && body.height < 0.4f) {
-                tips += Tip("comp.small", TipCategory.COMPOSITION, Severity.SUGGEST, "人物太小了，走近一点")
+                tips += Tip("comp.small", TipCategory.COMPOSITION, Severity.SUGGEST, "人太小了，拿着手机走近一点")
             }
         }
         return tips
+    }
+}
+
+/**
+ * Keeps composition guidance steady from frame to frame:
+ * - the subject position is smoothed so the marker does not jitter;
+ * - once a target line is picked it stays put until the subject is clearly closer to another one;
+ * - the shot type (close-up / half / full body) only changes after it has been seen for several frames;
+ * - "aligned" has hysteresis so it does not flicker at the edge.
+ */
+class CompositionTracker(
+    private val switchMargin: Float = 0.12f,
+    private val smoothing: Float = 0.35f,
+    private val lostResetMs: Long = 1500,
+) {
+    private var anchor: Vec2? = null
+    private var lockedX: Float? = null
+    private var lockedGrid: GridMode? = null
+    private var shot: ShotType? = null
+    private var pendingShot: ShotType? = null
+    private var pendingCount = 0
+    private var aligned = false
+    private var lastSeenMs = Long.MIN_VALUE / 2
+
+    fun reset() {
+        anchor = null
+        lockedX = null
+        lockedGrid = null
+        shot = null
+        pendingShot = null
+        pendingCount = 0
+        aligned = false
+    }
+
+    fun update(nowMs: Long, pose: PoseFrame?, level: LevelState?, grid: GridMode): CompositionResult {
+        val tips = ArrayList<Tip>()
+        level?.let { tips += CompositionRules.levelTips(it) }
+        if (pose == null || !pose.hasShoulders) {
+            if (nowMs - lastSeenMs > lostResetMs) reset()
+            return CompositionResult(null, null, null, false, null, null, tips)
+        }
+        lastSeenMs = nowMs
+
+        val shot = stableShot(pose.shotType)
+        val raw = CompositionRules.anchorOf(pose, shot)
+        val prev = anchor
+        val a = if (prev == null || abs(raw.x - prev.x) > 0.25f || abs(raw.y - prev.y) > 0.25f) {
+            raw
+        } else {
+            Vec2(prev.x + smoothing * (raw.x - prev.x), prev.y + smoothing * (raw.y - prev.y))
+        }
+        anchor = a
+
+        val xs = CompositionRules.targetXs(grid)
+        val nearest = xs.minBy { abs(it - a.x) }
+        val current = lockedX?.takeIf { lockedGrid == grid }
+        val tx = if (current == null || abs(nearest - a.x) + switchMargin < abs(current - a.x)) nearest else current
+        lockedX = tx
+        lockedGrid = grid
+
+        val ty = CompositionRules.targetY(grid, shot)
+        val dx = tx - a.x
+        val dy = if (ty == null) 0f else ty - a.y
+        val error = max(abs(dx), abs(dy))
+        aligned = if (aligned) error < EXIT_ALIGNED else error < ENTER_ALIGNED
+
+        val showTarget = grid != GridMode.OFF
+        if (showTarget && !aligned) {
+            tips += CompositionRules.placementTip(dx, dy, grid, fullBody = ty == null)
+        }
+        tips += CompositionRules.framingTips(pose, shot)
+        return CompositionResult(
+            anchor = a,
+            targetX = if (showTarget) tx else null,
+            targetY = if (showTarget) ty else null,
+            aligned = showTarget && aligned,
+            placementError = error,
+            shot = shot,
+            tips = tips,
+        )
+    }
+
+    private fun stableShot(raw: ShotType): ShotType {
+        val cur = shot
+        if (cur == null || raw == cur) {
+            shot = raw
+            pendingCount = 0
+            return raw
+        }
+        if (raw == pendingShot) pendingCount++ else {
+            pendingShot = raw
+            pendingCount = 1
+        }
+        if (pendingCount >= SHOT_CHANGE_FRAMES) {
+            shot = raw
+            pendingCount = 0
+            return raw
+        }
+        return cur
+    }
+
+    companion object {
+        const val ENTER_ALIGNED = 0.05f
+        const val EXIT_ALIGNED = 0.08f
+        private const val SHOT_CHANGE_FRAMES = 6
     }
 }

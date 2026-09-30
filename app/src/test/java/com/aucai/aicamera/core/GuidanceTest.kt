@@ -49,42 +49,81 @@ class GuidanceTest {
 
     private val level = LevelState(0f, false, 0f, 90f)
 
+    private fun analyze(pose: PoseFrame?, grid: GridMode = GridMode.THIRDS) =
+        CompositionTracker().update(0, pose, level, grid)
+
     @Test
     fun centredPersonIsGuidedToNearestThird() {
-        val r = CompositionAnalyzer.analyze(person(dx = 0.1f), level, GridMode.THIRDS, frontCamera = false)
-        assertNotNull(r.target)
-        assertEquals(2f / 3f, r.target!!.x, 1e-4f)
+        val r = analyze(person(dx = 0.1f))
+        assertEquals(2f / 3f, r.targetX!!, 1e-4f)
+        assertNull("full-body shots only get a vertical line", r.targetY)
         assertFalse(r.aligned)
         val tip = r.tips.first { it.id == "comp.place" }
-        // Subject must move right in frame → pan the phone left.
-        assertTrue(tip.text, tip.text.contains("向左"))
+        // Subject must move right in frame → move the phone left.
+        assertTrue(tip.text, tip.text.startsWith("手机向左移"))
     }
 
     @Test
-    fun frontCameraAdviceTalksAboutThePerson() {
-        val r = CompositionAnalyzer.analyze(person(dx = 0.1f), level, GridMode.THIRDS, frontCamera = true)
-        assertTrue(r.tips.first { it.id == "comp.place" }.text.startsWith("人往画面右边"))
+    fun adviceIsAlwaysAboutThePhone() {
+        for (dx in listOf(-0.3f, -0.1f, 0.1f, 0.3f)) {
+            for (full in listOf(true, false)) {
+                val r = analyze(person(dx = dx, fullBody = full))
+                r.tips.filter { it.category == TipCategory.COMPOSITION }.forEach {
+                    assertTrue(it.text, it.text.contains("手机") || it.text.contains("镜头"))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun targetStaysPutWhileSubjectMovesTowardsIt() {
+        val t = CompositionTracker()
+        // Start just left of centre → locks onto the left third.
+        val first = t.update(0, person(dx = -0.02f), level, GridMode.THIRDS)
+        assertEquals(1f / 3f, first.targetX!!, 1e-4f)
+        // Wobble across the middle: the target must not jump to the right third.
+        for ((i, dx) in listOf(0.02f, 0.05f, -0.01f, 0.04f).withIndex()) {
+            val r = t.update(100L * (i + 1), person(dx = dx), level, GridMode.THIRDS)
+            assertEquals(1f / 3f, r.targetX!!, 1e-4f)
+        }
+        // Clearly on the right third → switching is fine.
+        var r = t.update(1000, person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS)
+        repeat(10) { r = t.update(1100L + it * 100, person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS) }
+        assertEquals(2f / 3f, r.targetX!!, 1e-4f)
+    }
+
+    @Test
+    fun halfBodyTargetIsFixedOnScreen() {
+        val t = CompositionTracker()
+        val a = t.update(0, person(dy = -0.05f, fullBody = false), level, GridMode.THIRDS)
+        val b = t.update(100, person(dy = 0.05f, fullBody = false), level, GridMode.THIRDS)
+        assertEquals(1f / 3f, a.targetY!!, 1e-4f)
+        assertEquals(a.targetY!!, b.targetY!!, 1e-6f)
+        assertEquals(a.targetX!!, b.targetX!!, 1e-6f)
     }
 
     @Test
     fun personOnThirdIsAligned() {
-        val r = CompositionAnalyzer.analyze(person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS, frontCamera = false)
+        val t = CompositionTracker()
+        var r = t.update(0, person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS)
+        repeat(5) { r = t.update(100L * (it + 1), person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS) }
         assertTrue(r.aligned)
         assertTrue(r.tips.none { it.id == "comp.place" })
     }
 
     @Test
-    fun gridOffGivesNoTarget() {
-        val r = CompositionAnalyzer.analyze(person(), level, GridMode.OFF, frontCamera = false)
-        assertNull(r.target)
+    fun gridOffGivesNoTargetButStillScoresPlacement() {
+        val r = analyze(person(), GridMode.OFF)
+        assertNull(r.targetX)
+        assertNotNull(r.placementError)
     }
 
     @Test
     fun tiltedPhoneAsksToRaiseTheLowSide() {
-        val tips = CompositionAnalyzer.levelTips(LevelState(5f, false, 0f, 0f))
+        val tips = CompositionRules.levelTips(LevelState(5f, false, 0f, 0f))
         assertEquals(1, tips.size)
         assertTrue(tips[0].text.contains("右侧抬高"))
-        assertTrue(CompositionAnalyzer.levelTips(LevelState(1f, false, 0f, 0f)).isEmpty())
+        assertTrue(CompositionRules.levelTips(LevelState(1f, false, 0f, 0f)).isEmpty())
     }
 
     @Test
@@ -98,8 +137,7 @@ class GuidanceTest {
 
     @Test
     fun ankleCropIsFlagged() {
-        val p = person(dy = 0.07f) // ankles land at y = 1.0
-        val r = CompositionAnalyzer.analyze(p, level, GridMode.THIRDS, frontCamera = false)
+        val r = analyze(person(dy = 0.07f)) // ankles land at y = 1.0
         assertTrue(r.tips.any { it.id == "comp.jointcut" })
     }
 
@@ -150,11 +188,33 @@ class GuidanceTest {
         assertTrue(s.update(1400, emptyList()).isEmpty())
     }
 
+    private fun goodLight() = LightingAnalyzer.analyze(LumaGrid(4, 4, IntArray(16) { 130 }, 130f, 130f, 130f), null)
+
     @Test
-    fun scorePenalisesTips() {
-        assertEquals(100, ShotScore.of(emptyList()))
-        val warn = Tip("w", TipCategory.LIGHT, Severity.WARNING, "")
-        val sug = Tip("s", TipCategory.POSE, Severity.SUGGEST, "")
-        assertEquals(74, ShotScore.of(listOf(warn, sug)))
+    fun emptyFrameCannotScoreHigh() {
+        val comp = analyze(null)
+        val score = ShotScorer.score(comp, goodLight(), level, null, emptyList())
+        assertTrue("score ${score.total}", score.total < 75)
+        assertEquals("没有人物", score.items.first { it.category == TipCategory.COMPOSITION }.note)
+    }
+
+    @Test
+    fun wellPlacedPersonScoresHigherThanBadlyPlaced() {
+        val good = person(dx = 2f / 3f - 0.5f, fullBody = false, dy = 1f / 3f - 0.18f)
+        val bad = person(dx = 0.25f, fullBody = false, dy = 0.2f)
+        val sGood = ShotScorer.score(analyze(good), goodLight(), level, good, emptyList())
+        val sBad = ShotScorer.score(analyze(bad), goodLight(), level, bad, emptyList())
+        assertTrue("${sGood.total} vs ${sBad.total}", sGood.total > sBad.total + 10)
+        assertEquals("位置很好", sGood.items.first { it.category == TipCategory.COMPOSITION }.note)
+    }
+
+    @Test
+    fun poseAndLevelProblemsLowerTheScore() {
+        val p = person(dx = 2f / 3f - 0.5f, fullBody = false, dy = 1f / 3f - 0.18f)
+        val comp = analyze(p)
+        val clean = ShotScorer.score(comp, goodLight(), level, p, emptyList())
+        val tilted = ShotScorer.score(comp, goodLight(), LevelState(6f, false, 0f, 0f), p, PoseCoach.analyze(p))
+        assertTrue(tilted.total < clean.total)
+        assertEquals("歪了6°", tilted.items.first { it.category == TipCategory.LEVEL }.note)
     }
 }

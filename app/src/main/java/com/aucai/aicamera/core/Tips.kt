@@ -7,11 +7,10 @@ enum class TipCategory(val label: String) {
     LIGHT("光线"),
 }
 
-/** [penalty] is how many points the tip takes off the shot score. */
-enum class Severity(val penalty: Int) {
-    INFO(0),
-    SUGGEST(8),
-    WARNING(18),
+enum class Severity {
+    INFO,
+    SUGGEST,
+    WARNING,
 }
 
 /** A one-tap fix the UI can offer next to a tip. */
@@ -59,9 +58,4 @@ class TipStabilizer(
     }
 
     fun reset() = entries.clear()
-}
-
-object ShotScore {
-    /** 100 minus the penalty of every visible tip, never below 20. */
-    fun of(tips: List<Tip>): Int = (100 - tips.sumOf { it.severity.penalty }).coerceIn(20, 100)
 }

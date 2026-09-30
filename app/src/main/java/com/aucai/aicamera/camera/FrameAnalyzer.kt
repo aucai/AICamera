@@ -3,6 +3,7 @@ package com.aucai.aicamera.camera
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -27,6 +28,10 @@ class FrameAnalyzer(
     @Volatile var level: LevelState? = null
     @Volatile var grid = GridMode.THIRDS
 
+    /** Set from any thread to drop tracking state, e.g. after switching cameras. */
+    @Volatile var resetRequested = false
+
+    private val engine = GuidanceEngine()
     private var detector: PoseDetector? = null
     private var detectorFailed = false
 
@@ -35,7 +40,11 @@ class FrameAnalyzer(
             val upright = uprightBitmap(image)
             val pose = poseDetector()?.detect(upright)
             val luma = sampleLuma(upright)
-            val frame = GuidanceEngine.analyze(GuidanceInput(pose, luma, level, grid, frontCamera))
+            if (resetRequested) {
+                resetRequested = false
+                engine.reset()
+            }
+            val frame = engine.analyze(SystemClock.elapsedRealtime(), GuidanceInput(pose, luma, level, grid))
             onResult(frame, upright.width, upright.height)
         } catch (t: Throwable) {
             Log.e(TAG, "analysis failed", t)

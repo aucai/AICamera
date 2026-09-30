@@ -15,6 +15,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.util.Log
 import android.util.Size
 import android.view.HapticFeedbackConstants
@@ -64,6 +68,7 @@ import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -91,6 +96,7 @@ class MainActivity : AppCompatActivity() {
     private var wasAligned = false
     private var lastPhotoUri: Uri? = null
     private var countdownLeft = 0
+    private var smoothedScore = -1f
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -223,6 +229,8 @@ class MainActivity : AppCompatActivity() {
         } else {
             CameraSelector.LENS_FACING_BACK
         }
+        analyzer.resetRequested = true
+        smoothedScore = -1f
         if (hasCameraPermission()) startCamera()
     }
 
@@ -275,12 +283,16 @@ class MainActivity : AppCompatActivity() {
 
         var tips = frame.tips.filter { it.category in mode.categories }
         if (mode == Mode.POSE && frame.pose == null) {
-            tips = tips + Tip("pose.none", TipCategory.POSE, Severity.INFO, "没有检测到人物，让人进入画面")
+            tips = tips + Tip("pose.none", TipCategory.POSE, Severity.INFO, "没有检测到人物，把人框进画面")
         }
         val visible = stabilizer.update(SystemClock.elapsedRealtime(), tips)
         renderTips(visible)
 
-        binding.shutter.score = if (mode == Mode.POSE && frame.pose == null) null else ShotScore.of(visible)
+        // Smooth the total a little so the number is readable while things move.
+        val total = frame.score.total.toFloat()
+        smoothedScore = if (smoothedScore < 0f) total else smoothedScore + 0.25f * (total - smoothedScore)
+        binding.shutter.score = smoothedScore.roundToInt()
+        renderScoreItems(frame.score)
 
         val aligned = (mode == Mode.SMART || mode == Mode.COMPOSITION) && frame.composition.aligned
         if (aligned && !wasAligned) binding.overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
@@ -288,6 +300,27 @@ class MainActivity : AppCompatActivity() {
 
         if (voiceOn && countdownLeft == 0) {
             visible.firstOrNull { it.severity != Severity.INFO }?.let { speaker?.say(it.text) }
+        }
+    }
+
+    private fun renderScoreItems(score: ShotScore) {
+        val views = listOf(binding.scoreComposition, binding.scoreLight, binding.scorePose, binding.scoreLevel)
+        val byCategory = score.items.associateBy { it.category }
+        val order = listOf(TipCategory.COMPOSITION, TipCategory.LIGHT, TipCategory.POSE, TipCategory.LEVEL)
+        for ((view, category) in views.zip(order)) {
+            val item = byCategory[category] ?: continue
+            val head = if (item.applicable) "${category.label} ${item.points}/${item.max}" else "${category.label} —"
+            val color = when {
+                !item.applicable -> ContextCompat.getColor(this, R.color.text_secondary)
+                item.points >= item.max * 0.8f -> ContextCompat.getColor(this, R.color.good)
+                item.points >= item.max * 0.5f -> ContextCompat.getColor(this, R.color.accent)
+                else -> ContextCompat.getColor(this, R.color.bad)
+            }
+            val text = SpannableStringBuilder()
+                .append(head, ForegroundColorSpan(color), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                .append("\n")
+                .append(if (item.applicable) item.note else "无法判断", RelativeSizeSpan(0.85f), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            view.text = text
         }
     }
 

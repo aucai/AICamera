@@ -44,6 +44,13 @@ data class LightingResult(
     val gridHeight: Int,
     /** Where to meter when the user taps the fix button. */
     val meterPoint: Vec2?,
+    /** Share of cells that are blown out / crushed black. */
+    val highRatio: Float,
+    val lowRatio: Float,
+    /** Mean luma of the person (face if large enough, else upper body); null without a person. */
+    val subjectLuma: Float?,
+    val backlit: Boolean,
+    val splitLight: Boolean,
     val tips: List<Tip>,
 )
 
@@ -85,6 +92,9 @@ object LightingAnalyzer {
         }
 
         val tips = ArrayList<Tip>()
+        var subjectLuma: Float? = null
+        var backlit = false
+        var splitLight = false
         if (mean < 45f) {
             tips += Tip("light.dark", TipCategory.LIGHT, Severity.WARNING, "光线太暗，靠近光源或者开灯", TipAction.EXPOSURE_UP)
         }
@@ -92,7 +102,9 @@ object LightingAnalyzer {
         if (subject != null) {
             val subj = grid.mean(subject)
             val bg = grid.meanOutside(subject)
+            subjectLuma = subj
             if (subj != null && bg != null && subj < 85f && bg - subj > 55f) {
+                backlit = true
                 tips += Tip("light.backlit", TipCategory.LIGHT, Severity.WARNING, "逆光：人物比背景暗很多", TipAction.METER_SUBJECT)
             }
             if (subj != null && subject === face && subj > 215f) {
@@ -108,6 +120,7 @@ object LightingAnalyzer {
                 val lo = minOf(l, r)
                 val hi = maxOf(l, r)
                 if (lo < 110f && hi / lo.coerceAtLeast(1f) > 1.8f) {
+                    splitLight = true
                     tips += Tip("light.split", TipCategory.LIGHT, Severity.SUGGEST, "脸一侧偏暗，让脸稍微转向光源")
                 }
             }
@@ -128,6 +141,9 @@ object LightingAnalyzer {
             }
         }
 
-        return LightingResult(mean, hist, clipped, grid.width, grid.height, subject?.center, tips)
+        return LightingResult(
+            mean, hist, clipped, grid.width, grid.height, subject?.center,
+            highRatio, lowRatio, subjectLuma, backlit, splitLight, tips,
+        )
     }
 }

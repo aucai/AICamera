@@ -149,7 +149,6 @@ class GuideOverlayView @JvmOverloads constructor(
     private fun drawComposition(canvas: Canvas, f: GuidanceFrame) {
         val c = f.composition
         val anchor = c.anchor ?: return
-        val target = c.target
         val color = if (c.aligned) good else accent
         targetPaint.color = color
         arrowPaint.color = color
@@ -159,11 +158,19 @@ class GuideOverlayView @JvmOverloads constructor(
         val ax = x(anchor.x)
         val ay = y(anchor.y)
         canvas.drawCircle(ax, ay, 6 * dp, dotPaint)
-        if (target == null) return
-        val tx = x(target.x)
-        val ty = y(target.y)
-        canvas.drawCircle(tx, ty, 18 * dp, targetPaint)
-        canvas.drawCircle(tx, ty, 3 * dp, dotPaint)
+        val targetX = c.targetX ?: return
+        val tx = x(targetX)
+        val ty: Float
+        val targetY = c.targetY
+        if (targetY == null) {
+            // Full-body shot: the target is the whole vertical line, fixed on screen.
+            canvas.drawLine(tx, image.top, tx, image.bottom, targetPaint)
+            ty = ay
+        } else {
+            ty = y(targetY)
+            canvas.drawCircle(tx, ty, 18 * dp, targetPaint)
+            canvas.drawCircle(tx, ty, 3 * dp, dotPaint)
+        }
         if (c.aligned) return
 
         // Dashed arrow from the subject towards the target, stopping at the ring.
