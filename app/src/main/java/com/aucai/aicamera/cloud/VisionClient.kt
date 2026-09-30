@@ -16,7 +16,7 @@ enum class CloudPreset(val label: String, val baseUrl: String, val model: String
     QWEN(
         "通义千问（阿里云百炼）",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "qwen3-vl-plus",
+        "qwen3.7-plus",
         "在阿里云百炼控制台的「API-KEY」页面创建，形如 sk-…",
     ),
     DOUBAO(
