@@ -17,8 +17,8 @@ data class ShotScore(val total: Int, val items: List<ScoreItem>)
 /**
  * Scores the frame on what it actually shows, so a high score has to be earned:
  * composition 35, lighting 35, pose 20, level 10. Parts that cannot be judged are
- * left out and the rest scaled to 100. Without a person, composition gets only a
- * small base score because nothing can be placed.
+ * left out and the rest scaled to 100. Without a subject (person, object or horizon),
+ * composition gets only a small base score because nothing can be placed.
  */
 object ShotScorer {
 
@@ -29,13 +29,14 @@ object ShotScorer {
 
     fun score(
         composition: CompositionResult,
+        sceneTips: List<Tip>,
         lighting: LightingResult?,
         level: LevelState?,
         pose: PoseFrame?,
         poseTips: List<Tip>,
     ): ShotScore {
         val items = listOf(
-            composition(composition),
+            composition(composition, sceneTips),
             light(lighting),
             pose(pose, poseTips),
             level(level),
@@ -45,11 +46,11 @@ object ShotScorer {
         return ShotScore(total.coerceIn(0, 100), items)
     }
 
-    fun composition(c: CompositionResult): ScoreItem {
+    fun composition(c: CompositionResult, sceneTips: List<Tip> = emptyList()): ScoreItem {
         val error = c.placementError
-            ?: return ScoreItem(TipCategory.COMPOSITION, 10, COMPOSITION_MAX, "没有人物")
+            ?: return ScoreItem(TipCategory.COMPOSITION, 10, COMPOSITION_MAX, "没有主体")
         val placement = 20f * clamp01(1f - error / 0.2f)
-        val ids = c.tips.map { it.id }.toSet()
+        val ids = (c.tips + sceneTips).map { it.id }.toSet()
         var framing = 15f
         var problem: String? = null
         fun hit(id: String, penalty: Float, note: String) {
@@ -63,8 +64,17 @@ object ShotScorer {
         hit("comp.small", 6f, "人太小")
         hit("comp.headroom", 5f, "头顶太空")
         hit("comp.feet", 3f, "脚离底边远")
+        hit("comp.objcut", 6f, "主体被切")
+        hit("comp.objsmall", 6f, "主体太小")
+        hit("scene.food.close", 4f, "食物太小")
+        hit("scene.food.angle", 4f, "角度平淡")
+        hit("scene.pet.low", 4f, "机位太高")
         val points = (placement + framing.coerceAtLeast(0f)).roundToInt()
-        val note = problem ?: if (placement >= 16f) "位置很好" else "位置偏了"
+        val note = problem ?: when {
+            placement < 16f -> "位置偏了"
+            c.subject?.kind == SubjectKind.HORIZON -> "地平线很好"
+            else -> "位置很好"
+        }
         return ScoreItem(TipCategory.COMPOSITION, points, COMPOSITION_MAX, note)
     }
 

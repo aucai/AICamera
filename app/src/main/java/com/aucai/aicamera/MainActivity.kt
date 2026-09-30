@@ -15,10 +15,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
-import android.text.style.RelativeSizeSpan
 import android.util.Log
 import android.util.Size
 import android.view.HapticFeedbackConstants
@@ -61,7 +57,14 @@ import com.aucai.aicamera.core.TipCategory
 import com.aucai.aicamera.core.TipStabilizer
 import com.aucai.aicamera.databinding.ActivityMainBinding
 import com.aucai.aicamera.databinding.ViewTipBinding
+import com.aucai.aicamera.ui.PhotoReview
+import com.aucai.aicamera.ui.ReviewStore
+import com.aucai.aicamera.ui.ScorePills
 import com.aucai.aicamera.ui.Speaker
+import com.aucai.aicamera.core.Sharpness
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
+import android.graphics.ImageDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -97,6 +100,10 @@ class MainActivity : AppCompatActivity() {
     private var lastPhotoUri: Uri? = null
     private var countdownLeft = 0
     private var smoothedScore = -1f
+    private var extensionsManager: ExtensionsManager? = null
+    private var extensionActive = false
+    private var capturing = false
+    private val reviews by lazy { ReviewStore(this) }
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -123,14 +130,13 @@ class MainActivity : AppCompatActivity() {
 
         setupControls()
         renderSettings()
-        loadLatestPhoto()
-
         if (hasCameraPermission()) startCamera() else requestCamera.launch(Manifest.permission.CAMERA)
     }
 
     override fun onResume() {
         super.onResume()
         levelSensor.start()
+        loadLatestPhoto()
     }
 
     override fun onPause() {
@@ -171,7 +177,19 @@ class MainActivity : AppCompatActivity() {
     private fun startCamera() {
         binding.permissionPanel.visibility = View.GONE
         val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({ bindUseCases(future.get()) }, ContextCompat.getMainExecutor(this))
+        future.addListener({
+            val provider = future.get()
+            if (extensionsManager != null) {
+                bindUseCases(provider)
+                return@addListener
+            }
+            // The phone maker's own processing (HDR, night mode, noise reduction) when it is exposed.
+            val ext = ExtensionsManager.getInstanceAsync(this, provider)
+            ext.addListener({
+                extensionsManager = runCatching { ext.get() }.getOrNull()
+                bindUseCases(provider)
+            }, ContextCompat.getMainExecutor(this))
+        }, ContextCompat.getMainExecutor(this))
     }
 
     private fun bindUseCases(provider: ProcessCameraProvider) {
@@ -191,9 +209,14 @@ class MainActivity : AppCompatActivity() {
             .setTargetRotation(rotation)
             .build()
         preview.setSurfaceProvider(binding.previewView.surfaceProvider)
+        val fullResolution = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+            .build()
         val capture = ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-            .setResolutionSelector(fourByThree)
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setJpegQuality(95)
+            .setResolutionSelector(fullResolution)
             .setTargetRotation(rotation)
             .build()
         val analysis = ImageAnalysis.Builder()
@@ -205,10 +228,29 @@ class MainActivity : AppCompatActivity() {
         analysis.setAnalyzer(analysisExecutor, analyzer)
         analyzer.frontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
 
-        val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+        val base = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+        val em = extensionsManager
+        val extensionSelector = try {
+            if (em != null &&
+                em.isExtensionAvailable(base, ExtensionMode.AUTO) &&
+                em.isImageAnalysisSupported(base, ExtensionMode.AUTO)
+            ) em.getExtensionEnabledCameraSelector(base, ExtensionMode.AUTO) else null
+        } catch (e: Exception) {
+            null
+        }
         provider.unbindAll()
+        val bound = extensionSelector?.let { sel ->
+            try {
+                provider.bindToLifecycle(this, sel, preview, capture, analysis)
+            } catch (e: Exception) {
+                Log.w(TAG, "extension bind failed, falling back", e)
+                provider.unbindAll()
+                null
+            }
+        }
+        extensionActive = bound != null
         try {
-            camera = provider.bindToLifecycle(this, selector, preview, capture, analysis)
+            camera = bound ?: provider.bindToLifecycle(this, base, preview, capture, analysis)
             this.preview = preview
             imageCapture = capture
             imageAnalysis = analysis
@@ -293,6 +335,8 @@ class MainActivity : AppCompatActivity() {
         smoothedScore = if (smoothedScore < 0f) total else smoothedScore + 0.25f * (total - smoothedScore)
         binding.shutter.score = smoothedScore.roundToInt()
         renderScoreItems(frame.score)
+        binding.sceneChip.visibility = View.VISIBLE
+        binding.sceneChip.text = "AI 识别：${frame.scene}"
 
         val aligned = (mode == Mode.SMART || mode == Mode.COMPOSITION) && frame.composition.aligned
         if (aligned && !wasAligned) binding.overlay.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
@@ -304,24 +348,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderScoreItems(score: ShotScore) {
-        val views = listOf(binding.scoreComposition, binding.scoreLight, binding.scorePose, binding.scoreLevel)
-        val byCategory = score.items.associateBy { it.category }
-        val order = listOf(TipCategory.COMPOSITION, TipCategory.LIGHT, TipCategory.POSE, TipCategory.LEVEL)
-        for ((view, category) in views.zip(order)) {
-            val item = byCategory[category] ?: continue
-            val head = if (item.applicable) "${category.label} ${item.points}/${item.max}" else "${category.label} —"
-            val color = when {
-                !item.applicable -> ContextCompat.getColor(this, R.color.text_secondary)
-                item.points >= item.max * 0.8f -> ContextCompat.getColor(this, R.color.good)
-                item.points >= item.max * 0.5f -> ContextCompat.getColor(this, R.color.accent)
-                else -> ContextCompat.getColor(this, R.color.bad)
-            }
-            val text = SpannableStringBuilder()
-                .append(head, ForegroundColorSpan(color), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                .append("\n")
-                .append(if (item.applicable) item.note else "无法判断", RelativeSizeSpan(0.85f), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            view.text = text
-        }
+        ScorePills.render(
+            this,
+            listOf(binding.scoreComposition, binding.scoreLight, binding.scorePose, binding.scoreLevel),
+            score.items,
+        )
     }
 
     private fun renderTips(tips: List<Tip>) {
@@ -415,11 +446,49 @@ class MainActivity : AppCompatActivity() {
         binding.countdown.visibility = View.GONE
     }
 
+    /** Focus on the subject, wait for the phone to be still, then capture. */
     private fun takePhoto() {
-        val capture = imageCapture ?: return
-        val name = "AICamera_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val cam = camera ?: return
+        if (capturing) return
+        capturing = true
+        val frame = lastFrame
+        val subject = frame?.composition?.anchor
+        val (vx, vy) = if (subject != null) {
+            binding.overlay.toView(subject.x, subject.y)
+        } else {
+            binding.previewView.width / 2f to binding.previewView.height / 2f
+        }
+        val point = binding.previewView.meteringPointFactory.createPoint(vx, vy)
+        val focus = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+            .build()
+        var started = false
+        val next = Runnable {
+            if (started) return@Runnable
+            started = true
+            waitSteadyThenCapture(frame, SystemClock.elapsedRealtime())
+        }
+        cam.cameraControl.startFocusAndMetering(focus).addListener(next, ContextCompat.getMainExecutor(this))
+        mainHandler.postDelayed(next, 1200)
+    }
+
+    private fun waitSteadyThenCapture(frame: GuidanceFrame?, since: Long) {
+        if (!levelSensor.isSteady && SystemClock.elapsedRealtime() - since < 800) {
+            showCaptureNote("保持稳定…", 900)
+            mainHandler.postDelayed({ waitSteadyThenCapture(frame, since) }, 40)
+            return
+        }
+        capture(frame)
+    }
+
+    private fun capture(frame: GuidanceFrame?) {
+        val capture = imageCapture ?: run {
+            capturing = false
+            return
+        }
+        val fileName = "AICamera_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) + ".jpg"
         val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
         }
@@ -432,15 +501,25 @@ class MainActivity : AppCompatActivity() {
             .setMetadata(metadata)
             .build()
 
+        // Remember what the camera thought of this shot, for the review in the gallery.
+        if (frame != null) {
+            val tips = frame.tips.filter { it.severity != Severity.INFO }.map { it.text }.distinct()
+            reviews.put(fileName, PhotoReview(frame.score.total, frame.scene, frame.score.items, tips))
+        }
+
         flash()
         capture.takePicture(options, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                capturing = false
                 val uri = output.savedUri ?: return
                 lastPhotoUri = uri
                 showThumbnail(uri)
+                showCaptureNote(if (frame != null) "已保存 · ${frame.score.total} 分 · 点左下角看点评" else "已保存", 2500)
+                checkSharpness(uri, fileName)
             }
 
             override fun onError(exception: ImageCaptureException) {
+                capturing = false
                 Log.e(TAG, "capture failed", exception)
                 toast("拍照失败：${exception.message}")
             }
@@ -451,6 +530,41 @@ class MainActivity : AppCompatActivity() {
         binding.flash.animate().cancel()
         binding.flash.alpha = 0.85f
         binding.flash.animate().alpha(0f).setDuration(220).start()
+    }
+
+    private val hideCaptureNote = Runnable { binding.captureNote.visibility = View.GONE }
+
+    private fun showCaptureNote(text: String, durationMs: Long) {
+        binding.captureNote.text = text
+        binding.captureNote.visibility = View.VISIBLE
+        mainHandler.removeCallbacks(hideCaptureNote)
+        mainHandler.postDelayed(hideCaptureNote, durationMs)
+    }
+
+    /** Warns right away when a saved photo came out blurry. */
+    private fun checkSharpness(uri: Uri, name: String) {
+        Thread {
+            val variance = try {
+                val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val scale = 1000f / maxOf(info.size.width, info.size.height)
+                    if (scale < 1f) decoder.setTargetSize((info.size.width * scale).toInt(), (info.size.height * scale).toInt())
+                }
+                val px = IntArray(bmp.width * bmp.height)
+                bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+                val gray = IntArray(px.size) { i ->
+                    val c = px[i]
+                    (299 * ((c shr 16) and 0xff) + 587 * ((c shr 8) and 0xff) + 114 * (c and 0xff)) / 1000
+                }
+                Sharpness.laplacianVariance(gray, bmp.width, bmp.height)
+            } catch (e: Exception) {
+                null
+            }
+            if (variance != null && variance < Sharpness.BLURRY_BELOW) {
+                reviews.markBlurry(name)
+                runOnUiThread { if (!isDestroyed) showCaptureNote("这张可能有点糊，拿稳再拍一张", 3000) }
+            }
+        }.start()
     }
 
     private fun showThumbnail(uri: Uri) {
@@ -480,28 +594,16 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 null
             }
-            if (uri != null) runOnUiThread {
-                if (lastPhotoUri == null) {
-                    lastPhotoUri = uri
-                    showThumbnail(uri)
-                }
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                lastPhotoUri = uri
+                if (uri != null) showThumbnail(uri) else binding.thumbnail.setImageDrawable(null)
             }
         }.start()
     }
 
-    private fun openLastPhoto() {
-        val uri = lastPhotoUri ?: run {
-            toast("还没有拍照")
-            return
-        }
-        val intent = Intent(Intent.ACTION_VIEW)
-            .setDataAndType(uri, "image/jpeg")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
-            toast("没有可以打开图片的应用")
-        }
+    private fun openGallery() {
+        startActivity(Intent(this, GalleryActivity::class.java))
     }
 
     // --------------------------------------------------------------- controls
@@ -510,7 +612,7 @@ class MainActivity : AppCompatActivity() {
     private fun setupControls() {
         binding.shutter.setOnClickListener { onShutter() }
         binding.btnSwitch.setOnClickListener { switchCamera() }
-        binding.thumbnail.setOnClickListener { openLastPhoto() }
+        binding.thumbnail.setOnClickListener { openGallery() }
         binding.btnPermission.setOnClickListener { requestCamera.launch(Manifest.permission.CAMERA) }
 
         binding.btnGrid.setOnClickListener {

@@ -13,6 +13,7 @@ import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.Mode
 import com.aucai.aicamera.core.PoseIdx
+import com.aucai.aicamera.core.SubjectKind
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -55,6 +56,15 @@ class GuideOverlayView @JvmOverloads constructor(
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = accent }
     private val bonePaint = stroke(Color.WHITE, 3f).apply { strokeCap = Paint.Cap.ROUND }
     private val jointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val boxPaint = stroke(Color.argb(220, 255, 255, 255), 1.5f)
+    private val horizonPaint = stroke(Color.argb(200, 255, 255, 255), 1.5f).apply {
+        pathEffect = DashPathEffect(floatArrayOf(8 * dp, 6 * dp), 0f)
+    }
+    private val labelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(190, 14, 14, 16) }
+    private val labelText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 13 * dp
+    }
     private val zebraPaint = Paint().apply { color = Color.argb(120, 255, 90, 78) }
     private val histBg = Paint().apply { color = Color.argb(150, 14, 14, 16) }
     private val histBar = Paint().apply { color = Color.argb(220, 255, 255, 255) }
@@ -149,6 +159,7 @@ class GuideOverlayView @JvmOverloads constructor(
     private fun drawComposition(canvas: Canvas, f: GuidanceFrame) {
         val c = f.composition
         val anchor = c.anchor ?: return
+        val subject = c.subject
         val color = if (c.aligned) good else accent
         targetPaint.color = color
         arrowPaint.color = color
@@ -157,31 +168,59 @@ class GuideOverlayView @JvmOverloads constructor(
 
         val ax = x(anchor.x)
         val ay = y(anchor.y)
-        canvas.drawCircle(ax, ay, 6 * dp, dotPaint)
-        val targetX = c.targetX ?: return
-        val tx = x(targetX)
-        val ty: Float
+
+        // Show what was recognised, so it is clear what the advice is about.
+        when (subject?.kind) {
+            SubjectKind.OBJECT -> subject.box?.let { b ->
+                val r = RectF(x(b.left), y(b.top), x(b.right), y(b.bottom))
+                canvas.drawRoundRect(r, 8 * dp, 8 * dp, boxPaint)
+                drawLabel(canvas, subject.label, r.left, r.top)
+            }
+            SubjectKind.HORIZON -> {
+                canvas.drawLine(image.left, ay, image.right, ay, horizonPaint)
+                drawLabel(canvas, subject.label, image.left + 8 * dp, ay)
+            }
+            else -> Unit
+        }
+        if (subject?.kind != SubjectKind.HORIZON) canvas.drawCircle(ax, ay, 6 * dp, dotPaint)
+
+        val targetX = c.targetX
         val targetY = c.targetY
-        if (targetY == null) {
-            // Full-body shot: the target is the whole vertical line, fixed on screen.
-            canvas.drawLine(tx, image.top, tx, image.bottom, targetPaint)
-            ty = ay
-        } else {
-            ty = y(targetY)
-            canvas.drawCircle(tx, ty, 18 * dp, targetPaint)
-            canvas.drawCircle(tx, ty, 3 * dp, dotPaint)
+        if (targetX == null && targetY == null) return
+        val tx: Float
+        val ty: Float
+        when {
+            targetX != null && targetY != null -> {
+                tx = x(targetX)
+                ty = y(targetY)
+                canvas.drawCircle(tx, ty, 18 * dp, targetPaint)
+                canvas.drawCircle(tx, ty, 3 * dp, dotPaint)
+            }
+            targetX != null -> {
+                // Full-body shot: the whole vertical line is the target, fixed on screen.
+                tx = x(targetX)
+                ty = ay
+                canvas.drawLine(tx, image.top, tx, image.bottom, targetPaint)
+            }
+            else -> {
+                // Horizon: the whole horizontal line is the target.
+                tx = ax
+                ty = y(targetY!!)
+                canvas.drawLine(image.left, ty, image.right, ty, targetPaint)
+            }
         }
         if (c.aligned) return
 
-        // Dashed arrow from the subject towards the target, stopping at the ring.
+        // Dashed arrow from the subject towards the target.
         val len = hypot(tx - ax, ty - ay)
         if (len < 30 * dp) return
         val ux = (tx - ax) / len
         val uy = (ty - ay) / len
+        val stop = if (targetX != null && targetY != null) 22 * dp else 6 * dp
         val sx = ax + ux * 12 * dp
         val sy = ay + uy * 12 * dp
-        val ex = tx - ux * 22 * dp
-        val ey = ty - uy * 22 * dp
+        val ex = tx - ux * stop
+        val ey = ty - uy * stop
         canvas.drawLine(sx, sy, ex, ey, arrowPaint)
         val ang = atan2(uy, ux)
         val head = 10 * dp
@@ -189,6 +228,15 @@ class GuideOverlayView @JvmOverloads constructor(
             val a = ang + Math.PI.toFloat() + s * 0.5f
             canvas.drawLine(ex, ey, ex + cos(a) * head, ey + sin(a) * head, arrowHeadPaint)
         }
+    }
+
+    private fun drawLabel(canvas: Canvas, text: String, left: Float, bottom: Float) {
+        val pad = 6 * dp
+        val w = labelText.measureText(text) + pad * 2
+        val h = labelText.textSize + pad
+        val top = (bottom - h).coerceAtLeast(image.top)
+        canvas.drawRoundRect(left, top, left + w, top + h, 6 * dp, 6 * dp, labelBg)
+        canvas.drawText(text, left + pad, top + h - pad * 0.9f, labelText)
     }
 
     private fun drawSkeleton(canvas: Canvas, f: GuidanceFrame) {

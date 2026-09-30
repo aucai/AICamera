@@ -64,10 +64,12 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-extensions:$camerax")
     implementation("com.google.mediapipe:tasks-vision:1.0.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.12.4")
     implementation("com.google.android.material:material:1.13.0")
+    implementation("androidx.viewpager2:viewpager2:1.1.0")
 
     testImplementation("junit:junit:4.13.2")
 }

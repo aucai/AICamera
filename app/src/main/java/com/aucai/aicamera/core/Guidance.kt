@@ -9,6 +9,7 @@ enum class Mode(val label: String, val categories: Set<TipCategory>) {
 
 class GuidanceInput(
     val pose: PoseFrame?,
+    val objects: List<ObjectBox>,
     val luma: LumaGrid?,
     val level: LevelState?,
     val grid: GridMode,
@@ -19,6 +20,8 @@ class GuidanceFrame(
     val composition: CompositionResult,
     val lighting: LightingResult?,
     val score: ShotScore,
+    /** Short description of what the camera sees, e.g. "人像 · 半身 · 逆光". */
+    val scene: String,
     val tips: List<Tip>,
 )
 
@@ -30,11 +33,14 @@ class GuidanceEngine {
     fun reset() = composition.reset()
 
     fun analyze(nowMs: Long, input: GuidanceInput): GuidanceFrame {
-        val comp = composition.update(nowMs, input.pose, input.level, input.grid)
+        val subject = SubjectPicker.pick(input.pose, input.objects, input.luma)
+        val comp = composition.update(nowMs, subject, input.pose, input.level, input.grid)
+        val sceneTips = SceneAdvisor.tips(comp.subject, input.level)
         val lighting = input.luma?.let { LightingAnalyzer.analyze(it, input.pose) }
         val poseTips = PoseCoach.analyze(input.pose)
-        val score = ShotScorer.score(comp, lighting, input.level, input.pose, poseTips)
-        val tips = comp.tips + poseTips + (lighting?.tips ?: emptyList())
-        return GuidanceFrame(input.pose, comp, lighting, score, tips)
+        val score = ShotScorer.score(comp, sceneTips, lighting, input.level, input.pose, poseTips)
+        val scene = SceneAdvisor.describe(comp.subject, comp.shot, lighting)
+        val tips = comp.tips + sceneTips + poseTips + (lighting?.tips ?: emptyList())
+        return GuidanceFrame(input.pose, comp, lighting, score, scene, tips)
     }
 }

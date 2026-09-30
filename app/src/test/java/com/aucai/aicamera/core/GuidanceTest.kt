@@ -49,8 +49,10 @@ class GuidanceTest {
 
     private val level = LevelState(0f, false, 0f, 90f)
 
-    private fun analyze(pose: PoseFrame?, grid: GridMode = GridMode.THIRDS) =
-        CompositionTracker().update(0, pose, level, grid)
+    private fun CompositionTracker.feed(now: Long, pose: PoseFrame?, grid: GridMode = GridMode.THIRDS) =
+        update(now, SubjectPicker.pick(pose, emptyList(), null), pose, level, grid)
+
+    private fun analyze(pose: PoseFrame?, grid: GridMode = GridMode.THIRDS) = CompositionTracker().feed(0, pose, grid)
 
     @Test
     fun centredPersonIsGuidedToNearestThird() {
@@ -79,24 +81,24 @@ class GuidanceTest {
     fun targetStaysPutWhileSubjectMovesTowardsIt() {
         val t = CompositionTracker()
         // Start just left of centre → locks onto the left third.
-        val first = t.update(0, person(dx = -0.02f), level, GridMode.THIRDS)
+        val first = t.feed(0, person(dx = -0.02f))
         assertEquals(1f / 3f, first.targetX!!, 1e-4f)
         // Wobble across the middle: the target must not jump to the right third.
         for ((i, dx) in listOf(0.02f, 0.05f, -0.01f, 0.04f).withIndex()) {
-            val r = t.update(100L * (i + 1), person(dx = dx), level, GridMode.THIRDS)
+            val r = t.feed(100L * (i + 1), person(dx = dx))
             assertEquals(1f / 3f, r.targetX!!, 1e-4f)
         }
         // Clearly on the right third → switching is fine.
-        var r = t.update(1000, person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS)
-        repeat(10) { r = t.update(1100L + it * 100, person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS) }
+        var r = t.feed(1000, person(dx = 2f / 3f - 0.5f))
+        repeat(10) { r = t.feed(1100L + it * 100, person(dx = 2f / 3f - 0.5f)) }
         assertEquals(2f / 3f, r.targetX!!, 1e-4f)
     }
 
     @Test
     fun halfBodyTargetIsFixedOnScreen() {
         val t = CompositionTracker()
-        val a = t.update(0, person(dy = -0.05f, fullBody = false), level, GridMode.THIRDS)
-        val b = t.update(100, person(dy = 0.05f, fullBody = false), level, GridMode.THIRDS)
+        val a = t.feed(0, person(dy = -0.05f, fullBody = false))
+        val b = t.feed(100, person(dy = 0.05f, fullBody = false))
         assertEquals(1f / 3f, a.targetY!!, 1e-4f)
         assertEquals(a.targetY!!, b.targetY!!, 1e-6f)
         assertEquals(a.targetX!!, b.targetX!!, 1e-6f)
@@ -105,8 +107,8 @@ class GuidanceTest {
     @Test
     fun personOnThirdIsAligned() {
         val t = CompositionTracker()
-        var r = t.update(0, person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS)
-        repeat(5) { r = t.update(100L * (it + 1), person(dx = 2f / 3f - 0.5f), level, GridMode.THIRDS) }
+        var r = t.feed(0, person(dx = 2f / 3f - 0.5f))
+        repeat(5) { r = t.feed(100L * (it + 1), person(dx = 2f / 3f - 0.5f)) }
         assertTrue(r.aligned)
         assertTrue(r.tips.none { it.id == "comp.place" })
     }
@@ -193,17 +195,17 @@ class GuidanceTest {
     @Test
     fun emptyFrameCannotScoreHigh() {
         val comp = analyze(null)
-        val score = ShotScorer.score(comp, goodLight(), level, null, emptyList())
+        val score = ShotScorer.score(comp, emptyList(), goodLight(), level, null, emptyList())
         assertTrue("score ${score.total}", score.total < 75)
-        assertEquals("没有人物", score.items.first { it.category == TipCategory.COMPOSITION }.note)
+        assertEquals("没有主体", score.items.first { it.category == TipCategory.COMPOSITION }.note)
     }
 
     @Test
     fun wellPlacedPersonScoresHigherThanBadlyPlaced() {
         val good = person(dx = 2f / 3f - 0.5f, fullBody = false, dy = 1f / 3f - 0.18f)
         val bad = person(dx = 0.25f, fullBody = false, dy = 0.2f)
-        val sGood = ShotScorer.score(analyze(good), goodLight(), level, good, emptyList())
-        val sBad = ShotScorer.score(analyze(bad), goodLight(), level, bad, emptyList())
+        val sGood = ShotScorer.score(analyze(good), emptyList(), goodLight(), level, good, emptyList())
+        val sBad = ShotScorer.score(analyze(bad), emptyList(), goodLight(), level, bad, emptyList())
         assertTrue("${sGood.total} vs ${sBad.total}", sGood.total > sBad.total + 10)
         assertEquals("位置很好", sGood.items.first { it.category == TipCategory.COMPOSITION }.note)
     }
@@ -212,9 +214,65 @@ class GuidanceTest {
     fun poseAndLevelProblemsLowerTheScore() {
         val p = person(dx = 2f / 3f - 0.5f, fullBody = false, dy = 1f / 3f - 0.18f)
         val comp = analyze(p)
-        val clean = ShotScorer.score(comp, goodLight(), level, p, emptyList())
-        val tilted = ShotScorer.score(comp, goodLight(), LevelState(6f, false, 0f, 0f), p, PoseCoach.analyze(p))
+        val clean = ShotScorer.score(comp, emptyList(), goodLight(), level, p, emptyList())
+        val tilted = ShotScorer.score(comp, emptyList(), goodLight(), LevelState(6f, false, 0f, 0f), p, PoseCoach.analyze(p))
         assertTrue(tilted.total < clean.total)
         assertEquals("歪了6°", tilted.items.first { it.category == TipCategory.LEVEL }.note)
+    }
+
+    /** Bright sky above row [edge], dark ground below. */
+    private fun skyGrid(edge: Int, w: Int = 16, h: Int = 24) =
+        LumaGrid(w, h, IntArray(w * h) { if (it / w < edge) 210 else 70 }, 150f, 150f, 150f)
+
+    @Test
+    fun horizonFoundAndGuidedToAThird() {
+        val g = skyGrid(12)
+        val y = HorizonDetector.detect(g)
+        assertNotNull(y)
+        assertEquals(0.5f, y!!, 0.05f)
+        val subject = SubjectPicker.pick(null, emptyList(), g)!!
+        assertEquals(SubjectKind.HORIZON, subject.kind)
+        val r = CompositionTracker().update(0, subject, null, level, GridMode.THIRDS)
+        assertNull(r.targetX)
+        assertNotNull(r.targetY)
+        assertTrue(r.tips.first { it.id == "comp.place" }.text.contains("地平线"))
+    }
+
+    @Test
+    fun flatFrameHasNoHorizon() {
+        assertNull(HorizonDetector.detect(LumaGrid(16, 24, IntArray(16 * 24) { 128 }, 128f, 128f, 128f)))
+    }
+
+    @Test
+    fun petBeatsFurnitureAsSubject() {
+        val objects = listOf(
+            ObjectBox("couch", 0.9f, RectN(0f, 0.3f, 1f, 1f)),
+            ObjectBox("cat", 0.6f, RectN(0.4f, 0.5f, 0.6f, 0.7f)),
+        )
+        val s = SubjectPicker.pick(null, objects, null)!!
+        assertEquals("猫", s.label)
+        assertEquals(ObjectGroup.PET, s.group)
+    }
+
+    @Test
+    fun objectAdviceNamesTheObjectAndMovesThePhone() {
+        val s = SubjectPicker.pick(null, listOf(ObjectBox("cup", 0.8f, RectN(0.75f, 0.1f, 0.9f, 0.25f))), null)!!
+        val r = CompositionTracker().update(0, s, null, level, GridMode.THIRDS)
+        val tip = r.tips.first { it.id == "comp.place" }
+        assertTrue(tip.text, tip.text.startsWith("手机") && tip.text.contains("杯子"))
+        // Held upright over food → suggest a higher angle.
+        val tips = SceneAdvisor.tips(s, LevelState(0f, false, 0f, 90f, pitchDeg = 5f))
+        assertTrue(tips.any { it.id == "scene.food.angle" })
+        assertEquals("美食 · 杯子", SceneAdvisor.describe(s, null, null))
+    }
+
+    @Test
+    fun sharpnessSeparatesEdgesFromFlat() {
+        val w = 64
+        val h = 64
+        val checker = IntArray(w * h) { if ((it % w / 4 + it / w / 4) % 2 == 0) 20 else 230 }
+        val flat = IntArray(w * h) { 128 }
+        assertTrue(Sharpness.laplacianVariance(checker, w, h) > Sharpness.BLURRY_BELOW)
+        assertTrue(Sharpness.laplacianVariance(flat, w, h) < Sharpness.BLURRY_BELOW)
     }
 }

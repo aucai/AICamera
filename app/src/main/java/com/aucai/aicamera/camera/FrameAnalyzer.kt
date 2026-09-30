@@ -13,10 +13,11 @@ import com.aucai.aicamera.core.GuidanceFrame
 import com.aucai.aicamera.core.GuidanceInput
 import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.LumaGrid
+import com.aucai.aicamera.core.ObjectBox
 
 /**
  * Turns each camera frame into an upright, display-oriented bitmap (mirrored for the
- * front camera, like the preview), runs pose detection and the guidance rules on it,
+ * front camera, like the preview), runs pose and object detection and the guidance rules on it,
  * and hands the result to [onResult] on the analysis thread.
  */
 class FrameAnalyzer(
@@ -34,17 +35,28 @@ class FrameAnalyzer(
     private val engine = GuidanceEngine()
     private var detector: PoseDetector? = null
     private var detectorFailed = false
+    private var objectFinder: ObjectFinder? = null
+    private var objectFinderFailed = false
+    private var objects: List<ObjectBox> = emptyList()
+    private var objectsAt = 0L
 
     override fun analyze(image: ImageProxy) {
         try {
             val upright = uprightBitmap(image)
+            val now = SystemClock.elapsedRealtime()
             val pose = poseDetector()?.detect(upright)
+            // Objects move slowly compared to people; a few detections a second is plenty.
+            if (now - objectsAt >= OBJECT_INTERVAL_MS) {
+                objects = objectFinder()?.detect(upright) ?: emptyList()
+                objectsAt = now
+            }
             val luma = sampleLuma(upright)
             if (resetRequested) {
                 resetRequested = false
                 engine.reset()
+                objects = emptyList()
             }
-            val frame = engine.analyze(SystemClock.elapsedRealtime(), GuidanceInput(pose, luma, level, grid))
+            val frame = engine.analyze(now, GuidanceInput(pose, objects, luma, level, grid))
             onResult(frame, upright.width, upright.height)
         } catch (t: Throwable) {
             Log.e(TAG, "analysis failed", t)
@@ -74,14 +86,29 @@ class FrameAnalyzer(
         return detector
     }
 
+    private fun objectFinder(): ObjectFinder? {
+        if (objectFinder == null && !objectFinderFailed) {
+            try {
+                objectFinder = ObjectFinder(context)
+            } catch (t: Throwable) {
+                Log.e(TAG, "object model failed to load", t)
+                objectFinderFailed = true
+            }
+        }
+        return objectFinder
+    }
+
     fun close() {
         detector?.close()
         detector = null
+        objectFinder?.close()
+        objectFinder = null
     }
 
     companion object {
         private const val TAG = "FrameAnalyzer"
         private const val GRID_LONG_SIDE = 64
+        private const val OBJECT_INTERVAL_MS = 300L
 
         fun sampleLuma(bitmap: Bitmap): LumaGrid {
             val landscape = bitmap.width >= bitmap.height

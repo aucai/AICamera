@@ -9,8 +9,15 @@ import kotlin.math.sqrt
  * @property rollDeg how far the phone is rotated clockwise from level (as seen by the user).
  * @property flat the phone is lying (nearly) flat, e.g. shooting food from above.
  * @property tiltX / tiltY for flat mode: tilt towards the screen's right / top edge in degrees.
+ * @property pitchDeg 0 when the phone is held upright, 90 when it lies flat facing up or down.
  */
-data class LevelState(val rollDeg: Float, val flat: Boolean, val tiltX: Float, val tiltY: Float)
+data class LevelState(
+    val rollDeg: Float,
+    val flat: Boolean,
+    val tiltX: Float,
+    val tiltY: Float,
+    val pitchDeg: Float = 0f,
+)
 
 object LevelMath {
     /**
@@ -29,6 +36,7 @@ object LevelMath {
         val roll = Math.toDegrees(atan2(-x.toDouble(), y.toDouble())).toFloat()
         val tiltX = Math.toDegrees(asin((x / g).coerceIn(-1f, 1f).toDouble())).toFloat()
         val tiltY = Math.toDegrees(asin((y / g).coerceIn(-1f, 1f).toDouble())).toFloat()
-        return LevelState(roll, flat, tiltX, tiltY)
+        val pitch = Math.toDegrees(asin((abs(gz) / g).coerceIn(0f, 1f).toDouble())).toFloat()
+        return LevelState(roll, flat, tiltX, tiltY, pitch)
     }
 }

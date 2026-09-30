@@ -11,12 +11,15 @@ enum class GridMode(val label: String) {
 }
 
 /**
- * @property anchor where the subject is now (smoothed): the eyes, or for full-body shots the body centre line.
- * @property targetX where the anchor should go horizontally; null when no target is shown.
- * @property targetY where the eyes should go vertically; null for full-body shots (they only get a vertical line).
+ * @property anchor where the subject is now (smoothed): a person's eyes (body centre line for full-body
+ *   shots), an object's centre, or a point on the horizon.
+ * @property targetX where the anchor should go horizontally; null when that axis has no target.
+ * @property targetY where the anchor should go vertically; null when that axis has no target
+ *   (full-body shots only get a vertical line, horizons only a horizontal one).
  * @property placementError normalised distance from anchor to target (measured against thirds when the grid is off).
  */
 data class CompositionResult(
+    val subject: Subject?,
     val anchor: Vec2?,
     val targetX: Float?,
     val targetY: Float?,
@@ -51,12 +54,36 @@ object CompositionRules {
         GridMode.CENTER -> listOf(0.5f)
     }
 
-    /** Where the eyes should sit. Full-body shots have no vertical target. */
-    fun targetY(grid: GridMode, shot: ShotType): Float? = when {
+    /** Candidate horizontal lines for objects and horizons. */
+    fun targetYs(grid: GridMode): List<Float> = when (grid) {
+        GridMode.THIRDS, GridMode.OFF -> listOf(1f / 3f, 2f / 3f)
+        GridMode.GOLDEN -> listOf(0.382f, 0.618f)
+        GridMode.CENTER -> listOf(0.5f)
+    }
+
+    /** Where a person's eyes should sit. Full-body shots have no vertical target. */
+    fun personTargetY(grid: GridMode, shot: ShotType): Float? = when {
         shot == ShotType.FULL_BODY -> null
         grid == GridMode.GOLDEN -> 0.382f
         else -> 1f / 3f
     }
+
+    /** Candidate target points; a null coordinate means that axis is free. */
+    fun candidates(subject: Subject, shot: ShotType?, grid: GridMode): List<Pair<Float?, Float?>> = when (subject.kind) {
+        SubjectKind.PERSON -> {
+            val y = personTargetY(grid, shot ?: ShotType.HALF_BODY)
+            targetXs(grid).map { it to y }
+        }
+        SubjectKind.OBJECT -> {
+            val points = targetXs(grid).flatMap { x -> targetYs(grid).map { y -> x to y } }
+            // A plate of food or a single object also reads well dead centre.
+            if (subject.group == ObjectGroup.FOOD && grid != GridMode.CENTER) points + (0.5f to 0.5f) else points
+        }
+        SubjectKind.HORIZON -> targetYs(grid).map { null to it }
+    }
+
+    fun anchorOf(subject: Subject, pose: PoseFrame?, shot: ShotType?): Vec2 =
+        if (subject.kind == SubjectKind.PERSON && pose != null && shot != null) anchorOf(pose, shot) else subject.anchor
 
     fun anchorOf(pose: PoseFrame, shot: ShotType): Vec2 {
         val eyes = pose.eyes
@@ -67,19 +94,27 @@ object CompositionRules {
 
     /**
      * dx > 0: the subject has to move right in the frame, i.e. move the phone left.
-     * dy > 0: the eyes have to move down in the frame, i.e. raise the phone.
+     * dy > 0: the subject has to move down in the frame, i.e. raise the phone.
      */
-    fun placementTip(dx: Float, dy: Float, grid: GridMode, fullBody: Boolean): Tip {
+    fun placementTip(dx: Float, dy: Float, grid: GridMode, subject: Subject, xOnly: Boolean): Tip {
         val move = if (abs(dx) >= abs(dy)) {
             if (dx > 0) "手机向左移一点" else "手机向右移一点"
         } else {
             if (dy > 0) "手机往上抬一点" else "手机往下放一点"
         }
-        val goal = when {
-            grid == GridMode.CENTER -> "让人在画面正中"
-            fullBody -> "让人落在竖线上"
-            grid == GridMode.GOLDEN -> "让眼睛落在黄金分割点"
-            else -> "让眼睛落在三分点"
+        val point = when {
+            grid == GridMode.CENTER -> "画面正中"
+            grid == GridMode.GOLDEN -> "黄金分割点"
+            else -> "三分点"
+        }
+        val goal = when (subject.kind) {
+            SubjectKind.PERSON -> when {
+                grid == GridMode.CENTER -> "让人在画面正中"
+                xOnly -> "让人落在竖线上"
+                else -> "让眼睛落在$point"
+            }
+            SubjectKind.OBJECT -> "让${subject.label}落在$point"
+            SubjectKind.HORIZON -> if (grid == GridMode.CENTER) "让地平线在画面中间" else "让地平线落在横线上"
         }
         return Tip("comp.place", TipCategory.COMPOSITION, Severity.SUGGEST, "$move，$goal")
     }
@@ -123,7 +158,7 @@ object CompositionRules {
 /**
  * Keeps composition guidance steady from frame to frame:
  * - the subject position is smoothed so the marker does not jitter;
- * - once a target line is picked it stays put until the subject is clearly closer to another one;
+ * - once a target is picked it stays put until the subject is clearly closer to another one;
  * - the shot type (close-up / half / full body) only changes after it has been seen for several frames;
  * - "aligned" has hysteresis so it does not flicker at the edge.
  */
@@ -133,8 +168,9 @@ class CompositionTracker(
     private val lostResetMs: Long = 1500,
 ) {
     private var anchor: Vec2? = null
-    private var lockedX: Float? = null
-    private var lockedGrid: GridMode? = null
+    private var locked: Pair<Float?, Float?>? = null
+    private var lockKey: String? = null
+    private var subject: Subject? = null
     private var shot: ShotType? = null
     private var pendingShot: ShotType? = null
     private var pendingCount = 0
@@ -143,25 +179,36 @@ class CompositionTracker(
 
     fun reset() {
         anchor = null
-        lockedX = null
-        lockedGrid = null
+        locked = null
+        lockKey = null
+        subject = null
         shot = null
         pendingShot = null
         pendingCount = 0
         aligned = false
     }
 
-    fun update(nowMs: Long, pose: PoseFrame?, level: LevelState?, grid: GridMode): CompositionResult {
+    fun update(nowMs: Long, subjectNow: Subject?, pose: PoseFrame?, level: LevelState?, grid: GridMode): CompositionResult {
         val tips = ArrayList<Tip>()
         level?.let { tips += CompositionRules.levelTips(it) }
-        if (pose == null || !pose.hasShoulders) {
-            if (nowMs - lastSeenMs > lostResetMs) reset()
-            return CompositionResult(null, null, null, false, null, null, tips)
-        }
-        lastSeenMs = nowMs
 
-        val shot = stableShot(pose.shotType)
-        val raw = CompositionRules.anchorOf(pose, shot)
+        // Hold on to the last subject briefly so a missed detection does not make everything jump.
+        val subject = subjectNow ?: subject?.takeIf { nowMs - lastSeenMs <= lostResetMs }
+        if (subject == null) {
+            reset()
+            return CompositionResult(null, null, null, null, false, null, null, tips)
+        }
+        if (subjectNow != null) lastSeenMs = nowMs
+        val sameSubject = this.subject?.let { it.kind == subject.kind && it.label == subject.label } ?: false
+        if (!sameSubject) {
+            anchor = null
+            locked = null
+            aligned = false
+        }
+        this.subject = subject
+
+        val shot = if (subject.kind == SubjectKind.PERSON && pose != null && pose.hasShoulders) stableShot(pose.shotType) else shot
+        val raw = CompositionRules.anchorOf(subject, pose?.takeIf { it.hasShoulders }, shot)
         val prev = anchor
         val a = if (prev == null || abs(raw.x - prev.x) > 0.25f || abs(raw.y - prev.y) > 0.25f) {
             raw
@@ -170,31 +217,37 @@ class CompositionTracker(
         }
         anchor = a
 
-        val xs = CompositionRules.targetXs(grid)
-        val nearest = xs.minBy { abs(it - a.x) }
-        val current = lockedX?.takeIf { lockedGrid == grid }
-        val tx = if (current == null || abs(nearest - a.x) + switchMargin < abs(current - a.x)) nearest else current
-        lockedX = tx
-        lockedGrid = grid
+        // Pick (or keep) the target point.
+        val candidates = CompositionRules.candidates(subject, shot, grid)
+        fun dist(c: Pair<Float?, Float?>): Float =
+            max(c.first?.let { abs(it - a.x) } ?: 0f, c.second?.let { abs(it - a.y) } ?: 0f)
+        val nearest = candidates.minBy { dist(it) }
+        val key = "${grid.name}/${subject.kind}/${shot?.name}"
+        val current = locked?.takeIf { lockKey == key && it in candidates }
+        val target = if (current == null || dist(nearest) + switchMargin < dist(current)) nearest else current
+        locked = target
+        lockKey = key
 
-        val ty = CompositionRules.targetY(grid, shot)
-        val dx = tx - a.x
-        val dy = if (ty == null) 0f else ty - a.y
+        val dx = target.first?.let { it - a.x } ?: 0f
+        val dy = target.second?.let { it - a.y } ?: 0f
         val error = max(abs(dx), abs(dy))
         aligned = if (aligned) error < EXIT_ALIGNED else error < ENTER_ALIGNED
 
         val showTarget = grid != GridMode.OFF
         if (showTarget && !aligned) {
-            tips += CompositionRules.placementTip(dx, dy, grid, fullBody = ty == null)
+            tips += CompositionRules.placementTip(dx, dy, grid, subject, xOnly = target.second == null)
         }
-        tips += CompositionRules.framingTips(pose, shot)
+        if (subject.kind == SubjectKind.PERSON && pose != null && pose.hasShoulders && shot != null) {
+            tips += CompositionRules.framingTips(pose, shot)
+        }
         return CompositionResult(
+            subject = subject,
             anchor = a,
-            targetX = if (showTarget) tx else null,
-            targetY = if (showTarget) ty else null,
+            targetX = if (showTarget) target.first else null,
+            targetY = if (showTarget) target.second else null,
             aligned = showTarget && aligned,
             placementError = error,
-            shot = shot,
+            shot = if (subject.kind == SubjectKind.PERSON) shot else null,
             tips = tips,
         )
     }
