@@ -9,6 +9,8 @@ class GuidanceInput(
     val enhance: Boolean = true,
     /** The camera can light the subject (flash unit, or the screen for the front camera). */
     val hasFlash: Boolean = false,
+    /** Scene brightness (EV at ISO 100) from the camera's exposure; null when unknown. */
+    val sceneEv: Float? = null,
 )
 
 class GuidanceFrame(
@@ -30,17 +32,20 @@ class GuidanceEngine {
 
     private val composition = CompositionTracker()
     private val look = LookEngine()
+    private val horizon = HorizonTracker()
 
     fun reset() {
         composition.reset()
         look.reset()
+        horizon.reset()
     }
 
     /** Use the cloud model's framing for the current subject (null drops it). */
     fun setExternal(f: ExternalFraming?) = composition.aim.setExternal(f)
 
     fun analyze(nowMs: Long, input: GuidanceInput): GuidanceFrame {
-        val subject = SubjectPicker.pick(input.pose, input.objects, input.luma, composition.currentSubject)
+        val horizonY = horizon.update(input.luma, input.aim, input.sceneEv)
+        val subject = SubjectPicker.pick(input.pose, input.objects, horizonY, composition.currentSubject)
         val comp = composition.update(nowMs, subject, input.pose, input.aim)
         val lighting = input.luma?.let { LightingAnalyzer.analyze(it, input.pose) }
         val poseTips = PoseCoach.analyze(input.pose).sortedByDescending { it.severity.ordinal }

@@ -1,6 +1,8 @@
 package com.aucai.aicamera.core
 
 import kotlin.math.abs
+import kotlin.math.atan
+import kotlin.math.log2
 import kotlin.math.sqrt
 
 /** One object found by the detector. [label] is the COCO English name; [box] is display-normalized. */
@@ -74,10 +76,11 @@ object Coco {
 object SubjectPicker {
 
     /**
-     * Person first, then the most prominent object, then a horizon. An object overlapping [previous]
-     * is kept while it is still reasonably prominent, so the subject does not flip between similar things.
+     * Person first, then the most prominent object, then a horizon ([horizonY], from a
+     * [HorizonTracker]). An object overlapping [previous] is kept while it is still reasonably
+     * prominent, so the subject does not flip between similar things.
      */
-    fun pick(pose: PoseFrame?, objects: List<ObjectBox>, luma: LumaGrid?, previous: Subject? = null): Subject? {
+    fun pick(pose: PoseFrame?, objects: List<ObjectBox>, horizonY: Float?, previous: Subject? = null): Subject? {
         if (pose != null && pose.hasShoulders) {
             return Subject(SubjectKind.PERSON, "人物", pose.eyes, pose.bodyBounds())
         }
@@ -91,7 +94,7 @@ object SubjectPicker {
         (kept ?: best)?.let { o ->
             return Subject(SubjectKind.OBJECT, Coco.zh(o.label), o.box.center, o.box, Coco.group(o.label))
         }
-        luma?.let { HorizonDetector.detect(it) }?.let { y ->
+        horizonY?.let { y ->
             return Subject(SubjectKind.HORIZON, "地平线", Vec2(0.5f, y), null)
         }
         return null
@@ -145,6 +148,69 @@ object HorizonDetector {
         for (y in 0 until median) for (i in 0 until w) sum += g.luma[y * w + i]
         if (sum.toFloat() / (median * w) < 130f) return null
         return (median + 0.5f) / h
+    }
+}
+
+/**
+ * A bright-above / dark-below line is everywhere indoors too (a white wall over a cabinet, a window
+ * sill), so only call it a horizon when it also makes physical sense, and only once it has been seen
+ * for a few frames in a row:
+ * - a skyline is at or above eye level: from the phone's tilt and the lens's field of view, a line
+ *   well below eye level (a table edge, the top of a sofa) is not one;
+ * - outdoors is far brighter than indoors: the camera's exposure tells a dim room from daylight;
+ * - selfies and shots looking straight down have no horizon.
+ */
+class HorizonTracker(private val confirmFrames: Int = 5) {
+
+    private var streak = 0
+
+    fun reset() {
+        streak = 0
+    }
+
+    /** @return the horizon's y once confirmed, else null. */
+    fun update(luma: LumaGrid?, aim: AimInput, sceneEv: Float?): Float? {
+        val y = luma?.let { HorizonDetector.detect(it) }?.takeIf { plausible(it, aim, sceneEv) }
+        streak = if (y == null) 0 else streak + 1
+        return if (streak >= confirmFrames) y else null
+    }
+
+    companion object {
+        /** Below this scene brightness (EV at ISO 100) it is indoors or night: no landscape. */
+        const val MIN_OUTDOOR_EV = 8.5f
+        /** How far below eye level a horizon may appear (looking down from a hill, waves). */
+        const val MAX_BELOW_DEG = 4f
+        /** Mountains and buildings rise above eye level, but not this far. */
+        const val MAX_ABOVE_DEG = 30f
+
+        fun plausible(y: Float, aim: AimInput, sceneEv: Float?): Boolean {
+            if (aim.frontCamera) return false
+            if (sceneEv != null && sceneEv < MIN_OUTDOOR_EV) return false
+            val level = aim.level ?: return true
+            if (level.flat) return false
+            val view = aim.view ?: return abs(level.cameraPitchDeg) < 25f
+            return elevationDeg(y, level.cameraPitchDeg, view.tanHalfH / aim.zoom) in -MAX_BELOW_DEG..MAX_ABOVE_DEG
+        }
+
+        /**
+         * How far above eye level a point at height [y] (0 top, 1 bottom) of the picture is, for a
+         * camera looking [pitchDeg] down with tan(half the vertical field of view) = [tanHalfH].
+         */
+        fun elevationDeg(y: Float, pitchDeg: Float, tanHalfH: Float): Float =
+            Math.toDegrees(atan(((0.5f - y) * 2f * tanHalfH).toDouble())).toFloat() - pitchDeg
+    }
+}
+
+/** Scene brightness from the camera's exposure. */
+object SceneLight {
+    /**
+     * Exposure value normalised to ISO 100: about 5-7 in a room, 8-9 in a bright room, 12-15 in
+     * daylight.
+     */
+    fun ev100(aperture: Float, exposureNs: Long, iso: Int): Float {
+        val t = exposureNs / 1e9
+        val n = aperture.toDouble()
+        return (log2(n * n / t) - log2(iso / 100.0)).toFloat()
     }
 }
 

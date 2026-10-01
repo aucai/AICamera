@@ -40,6 +40,10 @@ class FrameAnalyzer(
     @Volatile var enhance = true
     /** The camera can light the subject (a flash unit, or the screen for selfies). */
     @Volatile var hasFlash = false
+    /** Exposure value of the latest preview frame at ISO 100 (from the camera's settings); null if unknown. */
+    @Volatile var ev100: Float? = null
+    /** Exposure compensation in effect, in stops (it shifts [ev100] away from the scene's brightness). */
+    @Volatile var evBias = 0f
     /** Field of view at zoom 1 for the current camera and orientation. */
     @Volatile var view: ViewGeometry? = null
 
@@ -81,7 +85,7 @@ class FrameAnalyzer(
             val aim = AimInput(
                 frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled, rotation(), view,
             )
-            val input = GuidanceInput(pose, objects, luma, aim, enhance, hasFlash)
+            val input = GuidanceInput(pose, objects, luma, aim, enhance, hasFlash, ev100?.plus(evBias))
             if (clearExternal) {
                 clearExternal = false
                 engine.setExternal(null)

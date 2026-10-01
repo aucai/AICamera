@@ -61,9 +61,15 @@ import com.aucai.aicamera.core.Filter
 import com.aucai.aicamera.core.CloudPrompts
 import com.aucai.aicamera.core.ExternalFraming
 import com.aucai.aicamera.core.SceneAnchor
+import com.aucai.aicamera.core.SceneLight
 import com.aucai.aicamera.core.Vec2
 import com.aucai.aicamera.core.ViewGeometry
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
@@ -292,12 +298,13 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.w(TAG, "screen flash unavailable", e)
         }
-        val analysis = ImageAnalysis.Builder()
+        val analysisBuilder = ImageAnalysis.Builder()
             .setResolutionSelector(analysisSize)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setTargetRotation(rotation)
-            .build()
+        watchExposure(analysisBuilder)
+        val analysis = analysisBuilder.build()
         analysis.setAnalyzer(analysisExecutor, analyzer)
         analyzer.frontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
 
@@ -352,6 +359,29 @@ class MainActivity : AppCompatActivity() {
         analyzer.resetRequested = true
         lastFrame = null
         binding.overlay.clear()
+    }
+
+    /**
+     * Reads the exposure the camera chose for each frame, which says how bright the scene really is
+     * (a room and daylight look alike once the camera has adjusted to them).
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun watchExposure(builder: ImageAnalysis.Builder) {
+        analyzer.ev100 = null
+        try {
+            Camera2Interop.Extender(builder).setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
+                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+                    if (time <= 0L || iso <= 0) return
+                    val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST) ?: 100
+                    val aperture = result.get(CaptureResult.LENS_APERTURE)?.takeIf { it > 0f } ?: 1.8f
+                    analyzer.ev100 = SceneLight.ev100(aperture, time, iso * boost / 100)
+                }
+            })
+        } catch (e: Exception) {
+            Log.w(TAG, "exposure readout unavailable", e)
+        }
     }
 
     /** tan(half field of view) across the long and short side of the 4:3 frame, at zoom 1. */
@@ -498,6 +528,7 @@ class MainActivity : AppCompatActivity() {
         val active = enhanceOn && frame.look.engaged
         exposureAssist.update(now, frame.look.exposure, active, range.lower..range.upper, state.exposureCompensationStep.toFloat())
             ?.let { cam.cameraControl.setExposureCompensationIndex(it) }
+        analyzer.evBias = currentEv()
     }
 
     private fun currentEv(): Float {

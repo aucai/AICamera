@@ -278,7 +278,7 @@ class GuidanceTest {
         val y = HorizonDetector.detect(g)
         assertNotNull(y)
         assertEquals(0.5f, y!!, 0.05f)
-        val subject = SubjectPicker.pick(null, emptyList(), g)!!
+        val subject = SubjectPicker.pick(null, emptyList(), y)!!
         assertEquals(SubjectKind.HORIZON, subject.kind)
         val t = CompositionTracker()
         var r = t.update(0, subject, null, aimInput())
