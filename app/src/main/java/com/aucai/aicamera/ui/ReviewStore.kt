@@ -45,6 +45,14 @@ class ReviewStore(context: Context) {
     }
 
     @Synchronized
+    fun setEdits(name: String, edits: String) {
+        val all = load()
+        val r = all.optJSONObject(name) ?: return
+        r.put("edits", edits)
+        save(all)
+    }
+
+    @Synchronized
     fun putAi(name: String, review: CloudReview) {
         val all = load()
         val r = all.optJSONObject(name) ?: encode(PhotoReview("", "", emptyList(), emptyList()))

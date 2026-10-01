@@ -1,6 +1,9 @@
 package com.aucai.aicamera.core
 
-/** A small downsampled copy of the frame: per-cell luma (0..255) plus average colour. */
+/**
+ * A small downsampled copy of the frame: per-cell luma (0..255) plus average colour, and when
+ * available each cell's colour ([rgb], 0xRRGGBB) for recognising sky, greenery and the like.
+ */
 class LumaGrid(
     val width: Int,
     val height: Int,
@@ -8,6 +11,7 @@ class LumaGrid(
     val meanR: Float,
     val meanG: Float,
     val meanB: Float,
+    val rgb: IntArray? = null,
 ) {
     init {
         require(luma.size == width * height)

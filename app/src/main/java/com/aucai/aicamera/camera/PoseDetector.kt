@@ -20,7 +20,7 @@ class PoseDetector(context: Context) : Closeable {
 
     init {
         val base = BaseOptions.builder()
-            .setModelAssetPath("pose_landmarker_full.task")
+            .setModelAssetPath("pose_landmarker_lite.task")
             .setDelegate(Delegate.CPU)
             .build()
         val options = PoseLandmarker.PoseLandmarkerOptions.builder()

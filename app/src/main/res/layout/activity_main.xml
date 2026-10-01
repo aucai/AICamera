@@ -6,12 +6,27 @@
     android:layout_height="match_parent"
     android:background="@color/bg">
 
-    <androidx.camera.view.PreviewView
-        android:id="@+id/previewView"
+    <!-- The live picture and the portrait-blur layer; the scene look is applied to both. -->
+    <FrameLayout
+        android:id="@+id/previewContainer"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        app:implementationMode="compatible"
-        app:scaleType="fitCenter" />
+        android:layout_height="match_parent">
+
+        <androidx.camera.view.PreviewView
+            android:id="@+id/previewView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            app:implementationMode="compatible"
+            app:scaleType="fitCenter" />
+
+        <ImageView
+            android:id="@+id/blurLayer"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:alpha="0"
+            android:importantForAccessibility="no"
+            android:scaleType="fitCenter" />
+    </FrameLayout>
 
     <com.aucai.aicamera.ui.GuideOverlayView
         android:id="@+id/overlay"
@@ -235,6 +250,12 @@
                 style="@style/StyleChip"
                 android:layout_marginStart="8dp"
                 android:text="@string/style_scene" />
+
+            <TextView
+                android:id="@+id/chipBlur"
+                style="@style/StyleChip"
+                android:layout_marginStart="8dp"
+                android:text="@string/style_blur" />
         </LinearLayout>
 
         <FrameLayout

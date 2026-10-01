@@ -32,8 +32,6 @@ data class AimInput(
 enum class AimPhase {
     /** Nothing to suggest (no subject yet, or still settling). */
     IDLE,
-    /** Tilt the phone up/down first. */
-    ANGLE,
     /** Move the phone until the target dot sits in the centre ring. */
     GUIDE,
     /** Aligned; waiting for the phone to be still. */
@@ -44,7 +42,10 @@ enum class AimPhase {
     DONE,
 }
 
-/** @property offsetDeg current minus recommended camera pitch: positive means looking too far down. */
+/**
+ * Advice on tilting the phone, shown as a tip (it never holds up the aiming).
+ * @property offsetDeg current minus recommended camera pitch: positive means looking too far down.
+ */
 data class AngleGuide(val offsetDeg: Float, val text: String)
 
 /**
@@ -119,7 +120,7 @@ object AngleAdvisor {
  */
 class AimAssist(
     private val settleMs: Long = 400,
-    private val holdMs: Long = 400,
+    private val holdMs: Long = 250,
 ) {
     private class Recommendation(
         /** View centre minus subject anchor at [zoomBase]; null when not tied to a subject. */
@@ -137,9 +138,6 @@ class AimAssist(
     private var phase = AimPhase.IDLE
     private var subjectSince = NEVER
     private var holdSince = 0L
-    private var angleOkSince = NEVER
-    private var angleDone = false
-    private var angleWasOff = false
     private var style: PortraitStyle? = null
 
     val hasExternal get() = rec?.size != null
@@ -156,8 +154,6 @@ class AimAssist(
         val zoomMul = (1f / maxOf(f.size.x, f.size.y)).coerceAtLeast(1f)
         rec = Recommendation(f.offset, zoomMul, f.zoomBase, f.reason, f.size, f.world)
         phase = AimPhase.GUIDE
-        // The model already judged the angle; do not interrupt with angle advice.
-        angleDone = true
     }
 
     /**
@@ -176,9 +172,6 @@ class AimAssist(
         rec = null
         phase = AimPhase.IDLE
         subjectSince = NEVER
-        angleOkSince = NEVER
-        angleDone = false
-        angleWasOff = false
     }
 
     fun update(nowMs: Long, s: FrameSubject?, input: AimInput): AimState {
@@ -200,20 +193,19 @@ class AimAssist(
             return AimState(AimPhase.IDLE)
         }
         if (s != null && subjectSince == NEVER) subjectSince = nowMs
+        // The cloud model already judged the angle.
+        val angle = if (s != null && rec?.size == null) angleAdvice(s, input) else null
 
-        // 1. Angle first: tilting changes the vertical framing, so settle it before recommending.
-        if (rec == null && s != null) angleState(nowMs, s, input)?.let { return it }
-
-        // 2. Recommend once the subject has been there a moment and the phone is still; then keep it.
+        // 1. Recommend once the subject has been there a moment and the phone is still; then keep it.
         var r = rec
         if (r == null) {
-            if (s == null || nowMs - subjectSince < settleMs || !input.steady) return AimState(AimPhase.IDLE)
+            if (s == null || nowMs - subjectSince < settleMs || !input.steady) return AimState(AimPhase.IDLE, angle = angle)
             r = recommend(s, input)
             rec = r
             phase = AimPhase.GUIDE
         }
 
-        // 3. Where the target is now. The offset was measured at the zoom of the time; zooming magnifies it.
+        // 2. Where the target is now. The offset was measured at the zoom of the time; zooming magnifies it.
         val k = input.zoom / r.zoomBase
         val fromSubject = if (s != null && r.offset != null) {
             Vec2(s.anchor.x + r.offset.x * k, s.anchor.y + r.offset.y * k)
@@ -272,44 +264,20 @@ class AimAssist(
         }
         val view = r.size?.let { Vec2(it.x * k, it.y * k) }
         return AimState(
-            phase, target, if (phase == AimPhase.ZOOM) zoomGoal else null, null, hint, r.reason, view, r.size != null,
+            phase, target, if (phase == AimPhase.ZOOM) zoomGoal else null, angle, hint, r.reason, view, r.size != null,
             r.world?.copyOf(),
         )
     }
 
-    private fun angleState(nowMs: Long, s: FrameSubject, input: AimInput): AimState? {
+    /** Tilt advice for the subject, or null when the angle is fine (or there is nothing to say). */
+    private fun angleAdvice(s: FrameSubject, input: AimInput): AngleGuide? {
         val level = input.level ?: return null
-        if (input.frontCamera) return null
-        // Flat over food is a top-down shot, which is also good.
-        if (level.flat && s.group == ObjectGroup.FOOD) return null
-        if (level.flat) return null
+        // Selfies, and flat over food (a top-down shot, which is also good).
+        if (input.frontCamera || level.flat) return null
         val (target, tolerance) = AngleAdvisor.recommend(s) ?: return null
         val offset = level.cameraPitchDeg - target
-        // Once the angle was right, allow more slack before asking again.
-        val limit = if (angleDone) tolerance * 2f else tolerance
-        if (abs(offset) > limit) {
-            angleDone = false
-            angleWasOff = true
-            angleOkSince = NEVER
-            phase = AimPhase.ANGLE
-            val text = AngleAdvisor.text(s, offset)
-            return AimState(AimPhase.ANGLE, angle = AngleGuide(offset, text), hint = text)
-        }
-        if (!angleDone) {
-            // Only confirm the angle when the user actually had to adjust it.
-            if (!angleWasOff) {
-                angleDone = true
-                return null
-            }
-            if (angleOkSince == NEVER) angleOkSince = nowMs
-            if (nowMs - angleOkSince < 300) {
-                return AimState(AimPhase.ANGLE, angle = AngleGuide(offset, "角度正好，保持"), hint = "角度正好，保持")
-            }
-            angleDone = true
-            // Start aiming afresh from the new angle.
-            subjectSince = nowMs - settleMs
-        }
-        return null
+        if (abs(offset) <= tolerance) return null
+        return AngleGuide(offset, AngleAdvisor.text(s, offset))
     }
 
     private fun recommend(s: FrameSubject, input: AimInput): Recommendation {
@@ -349,9 +317,9 @@ class AimAssist(
 
     companion object {
         /** Distances in frame heights: enter alignment, drop it, and consider the framing lost. */
-        const val ENTER = 0.05f
-        const val EXIT = 0.08f
-        const val LOST = 0.14f
+        const val ENTER = 0.07f
+        const val EXIT = 0.10f
+        const val LOST = 0.16f
         /** Drop a recommendation whose target has been off screen this long. */
         const val GIVE_UP_MS = 8000L
         private const val NEVER = Long.MIN_VALUE

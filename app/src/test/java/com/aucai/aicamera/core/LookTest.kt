@@ -14,34 +14,66 @@ class LookTest {
 
     private fun grey(v: Int) = (0xff shl 24) or (v shl 16) or (v shl 8) or v
 
+    private fun px(r: Int, g: Int, b: Int) = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+
+    private fun saturation(c: Int): Float {
+        val (r, g, b) = rgb(c)
+        val mx = maxOf(r, g, b)
+        return if (mx == 0) 0f else (mx - minOf(r, g, b)) / mx.toFloat()
+    }
+
+    private fun Filter.on(c: Int): Int = intArrayOf(c).also { PixelLook(params).apply(it) }[0]
+
     @Test
     fun noneIsIdentityAndMonoIsGrey() {
-        assertTrue(PixelLook(ColorMatrices.forFilter(Filter.NONE), 0f).isIdentity)
-        val px = intArrayOf(0xFFC83214.toInt())
-        PixelLook(ColorMatrices.forFilter(Filter.MONO), 0f).apply(px)
-        val (r, g, b) = rgb(px[0])
+        assertTrue(PixelLook(Filter.NONE.params).isIdentity)
+        val (r, g, b) = rgb(Filter.MONO.on(0xFFC83214.toInt()))
         assertEquals(r, g)
         assertEquals(g, b)
         // Alpha is kept.
-        assertEquals(0xff, (px[0] ushr 24))
+        assertEquals(0xff, Filter.MONO.on(0xFFC83214.toInt()) ushr 24)
     }
 
     @Test
-    fun foodFilterWarmsAndConcatWithIdentityIsNoOp() {
-        val px = intArrayOf(grey(128))
-        PixelLook(ColorMatrices.forFilter(Filter.FOOD), 0f).apply(px)
-        val (r, _, b) = rgb(px[0])
-        assertTrue(r > b)
-        val m = ColorMatrices.forFilter(Filter.VIVID)
-        assertArrayEquals(m, ColorMatrices.concat(ColorMatrices.IDENTITY, m), 1e-5f)
-        assertArrayEquals(m, ColorMatrices.concat(m, ColorMatrices.IDENTITY), 1e-5f)
+    fun sceneLooksWorkOnTheColoursThatMatter() {
+        val sky = px(110, 160, 220)
+        val leaf = px(90, 140, 60)
+        // Sky: a richer, deeper blue; foliage changes less.
+        val skyOut = Filter.SKY.on(sky)
+        assertTrue(saturation(skyOut) > saturation(sky) + 0.08f)
+        assertTrue(saturation(Filter.SKY.on(leaf)) - saturation(leaf) < saturation(skyOut) - saturation(sky))
+        // Greenery: richer greens.
+        assertTrue(saturation(Filter.GREEN.on(leaf)) > saturation(leaf) + 0.08f)
+        // Food: warmer.
+        val (r, _, b) = rgb(Filter.FOOD.on(grey(128)))
+        assertTrue(r > b + 8)
+        // Vibrance leaves skin alone: a skin tone gains less colour than a blue of the same strength.
+        val vibrant = LookParams(vibrance = 0.5f)
+        fun gain(c: Int) = saturation(intArrayOf(c).also { PixelLook(vibrant).apply(it) }[0]) - saturation(c)
+        val skin = px(220, 170, 140)
+        val blueish = px(140, 170, 220)
+        assertTrue("skin ${gain(skin)} blue ${gain(blueish)}", gain(skin) < 0.6f * gain(blueish))
+    }
+
+    @Test
+    fun everyToneCurveKeepsOrderAndRange() {
+        for (f in Filter.entries) {
+            val p = f.params.withFill(0.6f)
+            var prev = -1f
+            for (i in 0..200) {
+                val y = LookMath.tone(i / 200f, p)
+                assertTrue("${f.name} not monotonic at $i", y >= prev - 1e-6f)
+                assertTrue(y in 0f..1f)
+                prev = y
+            }
+        }
     }
 
     @Test
     fun fillLightLiftsShadowsMostAndKeepsOrder() {
         val values = (0..255).toList()
         val px = values.map { grey(it) }.toIntArray()
-        PixelLook(null, 0.6f).apply(px)
+        PixelLook(LookParams.IDENTITY.withFill(0.6f)).apply(px)
         val out = px.map { rgb(it).first }
         for (i in 1 until out.size) assertTrue("not monotonic at $i", out[i] >= out[i - 1])
         assertEquals(0, out[0])
@@ -49,10 +81,21 @@ class LookTest {
         assertTrue(out[40] - 40 > 25)
         assertTrue(out[40] - 40 > out[220] - 220)
         // Colours keep their hue: a dark red stays red.
-        val red = intArrayOf((0xff shl 24) or (60 shl 16) or (20 shl 8) or 20)
-        PixelLook(null, 0.6f).apply(red)
+        val red = intArrayOf(px(60, 20, 20))
+        PixelLook(LookParams.IDENTITY.withFill(0.6f)).apply(red)
         val (r, g, b) = rgb(red[0])
         assertTrue(r > 60 && r > 2 * g && g == b)
+    }
+
+    @Test
+    fun matricesAndBlending() {
+        assertArrayEquals(ColorMatrices.IDENTITY, ColorMatrices.approximate(LookParams.IDENTITY), 1e-6f)
+        val m = ColorMatrices.approximate(Filter.LANDSCAPE.params)
+        assertArrayEquals(m, ColorMatrices.concat(ColorMatrices.IDENTITY, m), 1e-5f)
+        assertArrayEquals(m, ColorMatrices.concat(m, ColorMatrices.IDENTITY), 1e-5f)
+        assertEquals(Filter.FOOD.params, lerp(Filter.NONE.params, Filter.FOOD.params, 1f))
+        assertEquals(Filter.NONE.params, lerp(Filter.NONE.params, Filter.FOOD.params, 0f))
+        assertEquals(Filter.FOOD.params.warmth / 2f, lerp(Filter.NONE.params, Filter.FOOD.params, 0.5f).warmth, 1e-5f)
     }
 
     @Test
@@ -188,19 +231,37 @@ class LookTest {
     private fun comp(phase: AimPhase) = CompositionResult(null, food(), null, AimState(phase, target = Vec2(0.5f, 0.5f)))
 
     @Test
-    fun lookEngagesOnceFramedAndLingersBriefly() {
+    fun lookFollowsTheSceneAndCropsOnceFramed() {
         val look = LookEngine(releaseMs = 1500)
-        assertFalse(look.update(0, comp(AimPhase.GUIDE), null, null, input).engaged)
-        val framed = look.update(100, comp(AimPhase.DONE), null, null, input)
+        val aiming = look.update(0, comp(AimPhase.GUIDE), null, null, input, SceneKind.FOOD)
+        // The colour look applies as soon as the scene is known; the crop waits for the framing.
+        assertFalse(aiming.engaged)
+        assertEquals(Filter.FOOD, aiming.filter)
+        assertNull(aiming.crop)
+        val framed = look.update(100, comp(AimPhase.DONE), null, null, input, SceneKind.FOOD)
         assertTrue(framed.engaged)
-        assertEquals(Filter.FOOD, framed.filter)
         assertEquals("1:1", framed.crop?.label)
         // A wobble out of the ring does not switch it off at once...
-        assertTrue(look.update(1000, comp(AimPhase.GUIDE), null, null, input).engaged)
+        assertTrue(look.update(1000, comp(AimPhase.GUIDE), null, null, input, SceneKind.FOOD).engaged)
         // ...but losing the framing for a while does.
-        assertFalse(look.update(2000, comp(AimPhase.GUIDE), null, null, input).engaged)
+        assertFalse(look.update(2000, comp(AimPhase.GUIDE), null, null, input, SceneKind.FOOD).engaged)
         // Turned off in the settings.
         val off = GuidanceInput(null, emptyList(), null, input.aim, enhance = false)
-        assertFalse(look.update(2100, comp(AimPhase.DONE), null, null, off).engaged)
+        assertFalse(look.update(2100, comp(AimPhase.DONE), null, null, off, SceneKind.FOOD).engaged)
+    }
+
+    @Test
+    fun cropKeepsEnoughPixelsWhenAlreadyZoomed() {
+        val zoomed = AutoCrop.plan(done, food(RectN(0.45f, 0.45f, 0.55f, 0.55f)), 0.75f, PortraitStyle.CLOSE, zoom = 2f)!!
+        // At 2x the crop may only trim to the square, not magnify further.
+        assertTrue(zoomed.first.width >= 0.92f * 0.99f)
+    }
+
+    @Test
+    fun sceneExposure() {
+        assertEquals(ExposureNeed.UP, LookAdvisor.exposureNeed(lighting(mean = 130f), false, SceneKind.SNOW))
+        assertEquals(ExposureNeed.DOWN, LookAdvisor.exposureNeed(lighting(mean = 130f), false, SceneKind.SUNSET))
+        assertEquals(ExposureNeed.UP, LookAdvisor.exposureNeed(lighting(mean = 120f), false, SceneKind.DOCUMENT))
+        assertEquals(ExposureNeed.OK, LookAdvisor.exposureNeed(lighting(mean = 130f), false, SceneKind.OBJECT))
     }
 }

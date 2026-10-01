@@ -242,21 +242,21 @@ class GuidanceTest {
     }
 
     @Test
-    fun fullBodyAsksForASlightlyLowAngleFirst() {
-        // Camera looking 10° down at a full-body shot.
+    fun angleAdviceIsATipThatDoesNotHoldUpAiming() {
+        // Camera looking 10° down at a full-body shot: aiming goes ahead, with a tip to tilt up.
         val r = CompositionTracker().run(person(fullBody = true), aimInput(pitch = 10f))
-        assertEquals(AimPhase.ANGLE, r.aim.phase)
+        assertTrue("phase ${r.aim.phase}", r.aim.phase != AimPhase.IDLE)
         assertTrue(r.aim.angle!!.offsetDeg > 0f)
-        assertTrue(r.aim.hint, r.aim.hint.contains("仰"))
-        // At the right angle the assistant moves on to aiming.
-        val ok = CompositionTracker().run(person(fullBody = true), aimInput(pitch = -6f), frames = 15)
-        assertTrue("phase ${ok.aim.phase}", ok.aim.phase != AimPhase.ANGLE)
+        assertTrue(r.aim.angle!!.text, r.aim.angle!!.text.contains("仰"))
+        // At the right angle there is nothing to say.
+        val ok = CompositionTracker().run(person(fullBody = true), aimInput(pitch = -6f))
+        assertNull(ok.aim.angle)
     }
 
     @Test
     fun frontCameraSkipsAngleAdvice() {
         val r = CompositionTracker().run(person(fullBody = true), aimInput(pitch = 20f, front = true))
-        assertTrue(r.aim.phase != AimPhase.ANGLE)
+        assertNull(r.aim.angle)
     }
 
     @Test
@@ -292,13 +292,14 @@ class GuidanceTest {
     fun objectRecommendationNamesTheObject() {
         val s = SubjectPicker.pick(null, listOf(ObjectBox("cup", 0.8f, RectN(0.6f, 0.1f, 0.75f, 0.25f))), null)!!
         val t = CompositionTracker()
-        // Food is shot at about 45°; held upright the assistant asks for that first.
-        assertEquals(AimPhase.ANGLE, t.update(0, s, null, aimInput()).aim.phase)
+        // Food is shot at about 45°: held upright, the assistant suggests tilting forward.
+        assertTrue(t.update(0, s, null, aimInput()).aim.angle!!.text.contains("45°"))
         val tilted = aimInput(pitch = 45f)
         var r = t.update(100, s, null, tilted)
         for (i in 2..12) r = t.update(i * 100L, s, null, tilted)
         assertTrue(r.aim.reason, r.aim.reason.contains("杯子"))
-        assertEquals("美食 · 杯子", SceneAdvisor.describe(s, null, null))
+        assertNull(r.aim.angle)
+        assertEquals("美食 · 杯子", SceneAdvisor.describe(SceneGuess(SceneKind.FOOD, "杯子"), null, null))
     }
 
     private fun goodLight() = LightingAnalyzer.analyze(LumaGrid(4, 4, IntArray(16) { 130 }, 130f, 130f, 130f), null)
@@ -361,7 +362,7 @@ class GuidanceTest {
     fun cloudFramingDrivesTheAimAndSkipsAngleAdvice() {
         val t = CompositionTracker()
         val p = person(fullBody = true)
-        // Looking down at a full-body shot would normally trigger angle advice first.
+        // Looking down at a full-body shot would normally bring angle advice.
         val input = aimInput(pitch = 15f)
         t.feed(0, p, input)
         t.aim.setExternal(ExternalFraming(Vec2(0.5f, 0.5f), 1f, "往右移", offset = Vec2(0.1f, 0.05f)))
@@ -372,6 +373,7 @@ class GuidanceTest {
         assertEquals(a.x + 0.1f, r.aim.target!!.x, 1e-3f)
         assertEquals(a.y + 0.05f, r.aim.target!!.y, 1e-3f)
         assertEquals(Vec2(0.5f, 0.5f), r.aim.view)
+        assertNull(r.aim.angle)
         assertEquals("往右移", r.aim.reason)
         // Dropping it goes back to the built-in recommendation.
         t.aim.setExternal(null)

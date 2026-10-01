@@ -26,8 +26,8 @@ import kotlin.math.sin
 
 /**
  * The guidance layer over the preview, kept deliberately sparse like a phone maker's camera:
- * a fixed centre ring with a target dot to aim at, two circles for the tilt angle, a level line that
- * only shows up when the phone is nearly level, and, once framed, the automatic crop (everything
+ * a fixed centre ring with a target dot to aim at, a level line that only shows up when the phone
+ * is nearly level, and, once framed, the automatic crop (everything
  * outside it dimmed). Assumes a FIT_CENTER preview with the same aspect ratio as the analysed frames.
  */
 class GuideOverlayView @JvmOverloads constructor(
@@ -62,8 +62,6 @@ class GuideOverlayView @JvmOverloads constructor(
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private val levelPaint = stroke(Color.WHITE, 2f).apply { strokeCap = Paint.Cap.ROUND }
-    private val angleFixed = stroke(Color.WHITE, 2f)
-    private val angleMoving = stroke(yellow, 2.5f)
     private val shadow = Color.argb(120, 0, 0, 0)
     private val framePaint = stroke(yellow, 2f).apply {
         pathEffect = DashPathEffect(floatArrayOf(10 * dp, 7 * dp), 0f)
@@ -84,7 +82,7 @@ class GuideOverlayView @JvmOverloads constructor(
 
     init {
         // Soft shadows keep thin white lines readable on bright scenes.
-        for (p in listOf(ringPaint, dotPaint, arrowPaint, levelPaint, angleFixed, angleMoving, framePaint)) {
+        for (p in listOf(ringPaint, dotPaint, arrowPaint, levelPaint, framePaint)) {
             p.setShadowLayer(3 * dp, 0f, 0f, shadow)
         }
     }
@@ -122,7 +120,6 @@ class GuideOverlayView @JvmOverloads constructor(
         if (gridOn) drawGrid(canvas, crop?.rect)
         val aim = frame?.composition?.aim
         when (aim?.phase) {
-            AimPhase.ANGLE -> drawAngle(canvas, aim)
             AimPhase.GUIDE, AimPhase.HOLD, AimPhase.ZOOM, AimPhase.DONE -> drawAim(canvas, aim)
             else -> Unit
         }
@@ -217,16 +214,6 @@ class GuideOverlayView @JvmOverloads constructor(
             arrow.close()
             canvas.drawPath(arrow, arrowPaint)
         }
-    }
-
-    /** Two circles: the white one is fixed, the yellow one moves with the tilt. Make them meet. */
-    private fun drawAngle(canvas: Canvas, aim: AimState) {
-        val g = aim.angle ?: return
-        val cx = image.centerX()
-        val cy = image.centerY()
-        canvas.drawCircle(cx, cy, ringRadius, angleFixed)
-        val off = (g.offsetDeg * 5 * dp).coerceIn(-image.height() / 3f, image.height() / 3f)
-        canvas.drawCircle(cx, cy + off, ringRadius * 0.75f, angleMoving)
     }
 
     /**

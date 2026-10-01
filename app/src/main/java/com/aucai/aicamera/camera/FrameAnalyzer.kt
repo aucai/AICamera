@@ -8,6 +8,9 @@ import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.aucai.aicamera.core.AimInput
+import com.aucai.aicamera.core.Bokeh
+import com.aucai.aicamera.core.ClassifierHit
+import com.aucai.aicamera.core.FloatMask
 import com.aucai.aicamera.core.ExternalFraming
 import com.aucai.aicamera.core.GuidanceEngine
 import com.aucai.aicamera.core.GuidanceFrame
@@ -16,18 +19,20 @@ import com.aucai.aicamera.core.LevelState
 import com.aucai.aicamera.core.LumaGrid
 import com.aucai.aicamera.core.ObjectBox
 import com.aucai.aicamera.core.PortraitStyle
+import com.aucai.aicamera.core.SubjectKind
 import com.aucai.aicamera.core.ViewGeometry
 
 /**
  * Turns each camera frame into an upright, display-oriented bitmap (mirrored for the
- * front camera, like the preview), runs pose and object detection and the guidance rules on it,
- * and hands the result to [onResult] on the analysis thread.
+ * front camera, like the preview), runs pose and object detection, the scene classifier and the
+ * guidance rules on it, and hands the result to [onResult] on the analysis thread, together with
+ * the live background-blur layer when portrait blur is on and a person is in view.
  */
 class FrameAnalyzer(
     private val context: Context,
     private val isSteady: () -> Boolean,
     private val rotation: () -> FloatArray?,
-    private val onResult: (frame: GuidanceFrame, width: Int, height: Int) -> Unit,
+    private val onResult: (frame: GuidanceFrame, width: Int, height: Int, blur: Bitmap?) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
     @Volatile var frontCamera = false
@@ -44,6 +49,8 @@ class FrameAnalyzer(
     @Volatile var ev100: Float? = null
     /** Exposure compensation in effect, in stops (it shifts [ev100] away from the scene's brightness). */
     @Volatile var evBias = 0f
+    /** Portrait background blur (live layer for the preview). */
+    @Volatile var bokeh = true
     /** Field of view at zoom 1 for the current camera and orientation. */
     @Volatile var view: ViewGeometry? = null
 
@@ -64,6 +71,12 @@ class FrameAnalyzer(
     private var objectFinderFailed = false
     private var objects: List<ObjectBox> = emptyList()
     private var objectsAt = 0L
+    private var classifier: SceneClassifier? = null
+    private var classifierFailed = false
+    private var classes: List<ClassifierHit> = emptyList()
+    private var classesAt = 0L
+    private var segmenter: PersonSegmenter? = null
+    private var segmenterFailed = false
 
     override fun analyze(image: ImageProxy) {
         try {
@@ -75,17 +88,23 @@ class FrameAnalyzer(
                 objects = objectFinder()?.detect(upright) ?: emptyList()
                 objectsAt = now
             }
+            // What the whole scene is changes slowly too.
+            if (now - classesAt >= CLASSIFY_INTERVAL_MS) {
+                classes = classifier()?.classify(upright) ?: emptyList()
+                classesAt = now
+            }
             val luma = sampleLuma(upright)
             if (resetRequested) {
                 resetRequested = false
                 engine.reset()
                 objects = emptyList()
+                classes = emptyList()
             }
             val frameAspect = upright.width.toFloat() / upright.height
             val aim = AimInput(
                 frameAspect, level, zoom, maxZoom, isSteady(), style, frontCamera, assistEnabled, rotation(), view,
             )
-            val input = GuidanceInput(pose, objects, luma, aim, enhance, hasFlash, ev100?.plus(evBias))
+            val input = GuidanceInput(pose, objects, luma, aim, enhance, hasFlash, ev100?.plus(evBias), classes)
             if (clearExternal) {
                 clearExternal = false
                 engine.setExternal(null)
@@ -99,12 +118,58 @@ class FrameAnalyzer(
                 snapshotListener = null
                 it(upright, frame)
             }
-            onResult(frame, upright.width, upright.height)
+            val blur = if (bokeh && frame.composition.subject?.kind == SubjectKind.PERSON) blurLayer(upright) else null
+            onResult(frame, upright.width, upright.height, blur)
         } catch (t: Throwable) {
             Log.e(TAG, "analysis failed", t)
         } finally {
             image.close()
         }
+    }
+
+    /**
+     * The live portrait blur: the frame's background, blurred, transparent where the person is. Laid
+     * over the sharp live preview it looks like portrait mode. Built small; blur hides that.
+     */
+    private fun blurLayer(upright: Bitmap): Bitmap? {
+        val mask = segmenter()?.segment(upright) ?: return null
+        if (mask.mean() < 0.01f) return null
+        val crisp = FloatMask(mask.width, mask.height, Bokeh.sharpen(mask.data))
+        val landscape = upright.width >= upright.height
+        val sw = if (landscape) BLUR_LONG_SIDE else BLUR_LONG_SIDE * upright.width / upright.height
+        val sh = if (landscape) BLUR_LONG_SIDE * upright.height / upright.width else BLUR_LONG_SIDE
+        val small = Bitmap.createScaledBitmap(upright, sw, sh, true)
+        val px = IntArray(sw * sh)
+        small.getPixels(px, 0, sw, 0, 0, sw, sh)
+        val smallMask = FloatArray(sw * sh) { crisp.sample((it % sw + 0.5f) / sw, (it / sw + 0.5f) / sh) }
+        val bg = Bokeh.background(Bokeh.toRgb(px), smallMask, sw, sh, BLUR_RADIUS)
+        val ow = sw * 2
+        val oh = sh * 2
+        return Bitmap.createBitmap(Bokeh.overlay(bg, sw, sh, crisp, ow, oh), ow, oh, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun classifier(): SceneClassifier? {
+        if (classifier == null && !classifierFailed) {
+            try {
+                classifier = SceneClassifier(context)
+            } catch (t: Throwable) {
+                Log.e(TAG, "scene model failed to load", t)
+                classifierFailed = true
+            }
+        }
+        return classifier
+    }
+
+    private fun segmenter(): PersonSegmenter? {
+        if (segmenter == null && !segmenterFailed) {
+            try {
+                segmenter = PersonSegmenter(context)
+            } catch (t: Throwable) {
+                Log.e(TAG, "segmentation model failed to load", t)
+                segmenterFailed = true
+            }
+        }
+        return segmenter
     }
 
     private fun uprightBitmap(image: ImageProxy): Bitmap {
@@ -145,12 +210,19 @@ class FrameAnalyzer(
         detector = null
         objectFinder?.close()
         objectFinder = null
+        classifier?.close()
+        classifier = null
+        segmenter?.close()
+        segmenter = null
     }
 
     companion object {
         private const val TAG = "FrameAnalyzer"
         private const val GRID_LONG_SIDE = 64
         private const val OBJECT_INTERVAL_MS = 500L
+        private const val CLASSIFY_INTERVAL_MS = 700L
+        private const val BLUR_LONG_SIDE = 160
+        private const val BLUR_RADIUS = 4
 
         fun sampleLuma(bitmap: Bitmap): LumaGrid {
             val landscape = bitmap.width >= bitmap.height
@@ -171,7 +243,7 @@ class FrameAnalyzer(
                 (299 * cr + 587 * cg + 114 * cb) / 1000
             }
             val n = px.size.toFloat()
-            return LumaGrid(small.width, small.height, luma, r / n, g / n, b / n)
+            return LumaGrid(small.width, small.height, luma, r / n, g / n, b / n, px)
         }
     }
 }

@@ -3,16 +3,20 @@ package com.aucai.aicamera.camera
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
+import android.graphics.Matrix
 import android.graphics.Rect
 import androidx.exifinterface.media.ExifInterface
 import android.os.Build
-import com.aucai.aicamera.core.ColorMatrices
+import com.aucai.aicamera.core.Bokeh
 import com.aucai.aicamera.core.ExifOrientation
 import com.aucai.aicamera.core.Filter
+import com.aucai.aicamera.core.FloatMask
 import com.aucai.aicamera.core.PixelLook
 import com.aucai.aicamera.core.RectN
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.Executors
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -20,14 +24,16 @@ import kotlin.math.roundToInt
  * What to do to a photo after it is taken.
  * @property crop in display-normalized coordinates of the upright picture (as seen in the preview).
  * @property fill 0..1 software fill light.
+ * @property bokeh blur the background behind the person.
  */
-data class PhotoEdits(val crop: RectN?, val filter: Filter, val fill: Float) {
-    val isEmpty get() = crop == null && filter == Filter.NONE && fill < 0.01f
+data class PhotoEdits(val crop: RectN?, val filter: Filter, val fill: Float, val bokeh: Boolean = false) {
+    val isEmpty get() = crop == null && filter == Filter.NONE && fill < 0.01f && !bokeh
 }
 
 /**
- * Crops and colours a JPEG from the camera. Only the cropped region is decoded, at full resolution,
- * and the picture keeps its stored orientation (plus EXIF), so no extra copy is needed to rotate it.
+ * Crops, blurs the background and colours a JPEG from the camera. Only the cropped region is
+ * decoded, at full resolution, and the picture keeps its stored orientation (plus EXIF), so no
+ * extra copy is needed to rotate it. The pixel work is split over the CPU cores.
  */
 object PhotoProcessor {
 
@@ -44,7 +50,14 @@ object PhotoProcessor {
         ExifInterface.TAG_WHITE_BALANCE,
     )
 
-    fun process(src: File, dst: File, edits: PhotoEdits) {
+    /** Size of the copy the person is found on and the background blurred on. */
+    private const val SMALL_SIDE = 512
+
+    /**
+     * @param segment finds the person in an upright picture (for the background blur).
+     * @return whether the background blur was applied (false when no person was found).
+     */
+    fun process(src: File, dst: File, edits: PhotoEdits, segment: ((Bitmap) -> FloatMask?)? = null): Boolean {
         val exif = ExifInterface(src.absolutePath)
         val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -81,28 +94,90 @@ object PhotoProcessor {
         } finally {
             decoder.recycle()
         }
+        var blurred = false
         try {
-            val look = PixelLook(ColorMatrices.forFilter(edits.filter), edits.fill)
-            if (!look.isIdentity) applyLook(bmp, look)
+            val blur = if (edits.bokeh && segment != null) prepareBlur(bmp, orientation, segment) else null
+            val look = PixelLook(edits.filter.params.withFill(edits.fill))
+            if (blur != null || !look.isIdentity) {
+                val w = bmp.width
+                val h = bmp.height
+                forStrips(bmp) { px, y0, rows ->
+                    blur?.let { Bokeh.composite(px, w, y0, rows, h, it.mask, it.bg, it.w, it.h) }
+                    look.apply(px)
+                }
+            }
+            blurred = blur != null
             FileOutputStream(dst).use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
         } finally {
             bmp.recycle()
         }
         copyExif(exif, dst, orientation)
+        return blurred
     }
 
-    /** A strip at a time, so only a small pixel buffer is needed next to the bitmap. */
-    private fun applyLook(bmp: Bitmap, look: PixelLook) {
+    private class Blur(val mask: FloatArray, val bg: FloatArray, val w: Int, val h: Int)
+
+    /**
+     * Finds the person on a small upright copy, brings the mask back to the stored orientation,
+     * snaps its edges to the picture's and blurs the background without the person in it.
+     */
+    private fun prepareBlur(bmp: Bitmap, orientation: Int, segment: (Bitmap) -> FloatMask?): Blur? {
+        val scale = SMALL_SIDE.toFloat() / max(bmp.width, bmp.height)
+        val sw = max(1, (bmp.width * scale).roundToInt())
+        val sh = max(1, (bmp.height * scale).roundToInt())
+        val small = Bitmap.createScaledBitmap(bmp, sw, sh, true)
+        val m = orientationMatrix(orientation)
+        val upright = if (m.isIdentity) small else Bitmap.createBitmap(small, 0, 0, sw, sh, m, true)
+        val found = segment(upright) ?: return null
+        // Nobody there (or barely): blurring would only spoil the photo.
+        if (found.mean() < 0.02f) return null
+        val raw = FloatArray(sw * sh) {
+            val (ux, uy) = ExifOrientation.rawToUpright((it % sw + 0.5f) / sw, (it / sw + 0.5f) / sh, orientation)
+            found.sample(ux, uy)
+        }
+        val px = IntArray(sw * sh)
+        small.getPixels(px, 0, sw, 0, 0, sw, sh)
+        val rgb = Bokeh.toRgb(px)
+        // Snap the edges to the picture, then firm them up again so the background next to the
+        // person is not left half sharp.
+        val snapped = Bokeh.guidedFilter(Bokeh.luma(rgb), Bokeh.sharpen(raw), sw, sh, r = 6, eps = 1e-3f)
+        val mask = Bokeh.sharpen(snapped, 0.2f, 0.8f)
+        val bg = Bokeh.background(rgb, mask, sw, sh, r = max(2, SMALL_SIDE / 56))
+        return Blur(mask, bg, sw, sh)
+    }
+
+    /** Rotation/mirroring that makes a stored picture upright, per its EXIF orientation. */
+    private fun orientationMatrix(o: Int) = Matrix().apply {
+        when (o) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> setScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> setRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> setScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> { setRotate(90f); postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_90 -> setRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> { setRotate(-90f); postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_270 -> setRotate(-90f)
+        }
+    }
+
+    /** Runs [work] on strips of rows in parallel; each strip gets its own pixel buffer. */
+    private fun forStrips(bmp: Bitmap, work: (px: IntArray, y0: Int, rows: Int) -> Unit) {
         val w = bmp.width
-        val rows = (262_144 / w).coerceAtLeast(1)
-        val buf = IntArray(w * rows)
-        var y = 0
-        while (y < bmp.height) {
-            val n = min(rows, bmp.height - y)
-            bmp.getPixels(buf, 0, w, 0, y, w, n)
-            look.apply(buf, 0, w * n)
-            bmp.setPixels(buf, 0, w, 0, y, w, n)
-            y += n
+        val h = bmp.height
+        val rows = (131_072 / w).coerceAtLeast(1)
+        val pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
+        try {
+            val jobs = (0 until h step rows).map { y0 ->
+                pool.submit {
+                    val n = min(rows, h - y0)
+                    val px = IntArray(w * n)
+                    synchronized(bmp) { bmp.getPixels(px, 0, w, 0, y0, w, n) }
+                    work(px, y0, n)
+                    synchronized(bmp) { bmp.setPixels(px, 0, w, 0, y0, w, n) }
+                }
+            }
+            jobs.forEach { it.get() }
+        } finally {
+            pool.shutdown()
         }
     }
 

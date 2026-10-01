@@ -7,10 +7,12 @@ import android.content.ContentUris
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
@@ -50,6 +52,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.aucai.aicamera.camera.FrameAnalyzer
 import com.aucai.aicamera.camera.PhotoEdits
+import com.aucai.aicamera.camera.PersonSegmenter
 import com.aucai.aicamera.camera.PhotoProcessor
 import com.aucai.aicamera.cloud.CloudException
 import com.aucai.aicamera.cloud.CloudSettings
@@ -58,6 +61,11 @@ import com.aucai.aicamera.core.CloudAdvice
 import com.aucai.aicamera.core.ColorMatrices
 import com.aucai.aicamera.core.ExposureAssist
 import com.aucai.aicamera.core.Filter
+import com.aucai.aicamera.core.LookParams
+import com.aucai.aicamera.core.SceneKind
+import com.aucai.aicamera.core.SceneRecognizer
+import com.aucai.aicamera.core.lerp
+import com.aucai.aicamera.ui.LookEffects
 import com.aucai.aicamera.core.CloudPrompts
 import com.aucai.aicamera.core.ExternalFraming
 import com.aucai.aicamera.core.SceneAnchor
@@ -132,6 +140,7 @@ class MainActivity : AppCompatActivity() {
     private var voiceOn = false
     private var style = PortraitStyle.CLOSE
     private var enhanceOn = true
+    private var bokehOn = true
     /** A filter the user picked; null = choose one for the scene once framed. */
     private var filterChoice: Filter? = null
 
@@ -152,9 +161,13 @@ class MainActivity : AppCompatActivity() {
     private var extensionActive = false
     private val exposureAssist = ExposureAssist()
     private var previewFilter = Filter.NONE
-    private var previewMatrix = ColorMatrices.IDENTITY
+    private var previewLook = LookParams.IDENTITY
     private var filterAnimator: ValueAnimator? = null
     private val layerPaint = Paint()
+    private var shaderFailed = false
+    private var exposureScene = SceneKind.UNKNOWN
+    /** Finds the person in saved photos; only used on [photoExecutor]. */
+    private var photoSegmenter: PersonSegmenter? = null
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -181,8 +194,8 @@ class MainActivity : AppCompatActivity() {
             onRotation = { binding.overlay.invalidate() },
         )
         levelSensor.displayRotationDeg = displayRotationDegrees()
-        analyzer = FrameAnalyzer(this, { levelSensor.isSteady }, { levelSensor.rotation() }) { frame, w, h ->
-            runOnUiThread { onFrame(frame, w, h) }
+        analyzer = FrameAnalyzer(this, { levelSensor.isSteady }, { levelSensor.rotation() }) { frame, w, h, blur ->
+            runOnUiThread { onFrame(frame, w, h, blur) }
         }
         binding.overlay.projector = { world ->
             val r = levelSensor.rotation()
@@ -192,6 +205,7 @@ class MainActivity : AppCompatActivity() {
         analyzer.style = style
         analyzer.assistEnabled = assistOn
         analyzer.enhance = enhanceOn
+        analyzer.bokeh = bokehOn
         // Selfie fill light: the screen turns white and bright while the photo is taken.
         binding.screenFlash.setScreenFlashWindow(window)
 
@@ -219,6 +233,7 @@ class MainActivity : AppCompatActivity() {
         filterAnimator?.cancel()
         analysisExecutor.execute { analyzer.close() }
         analysisExecutor.shutdown()
+        photoExecutor.execute { photoSegmenter?.close() }
         photoExecutor.shutdown()
         cloudExecutor.shutdown()
         speaker?.shutdown()
@@ -446,7 +461,7 @@ class MainActivity : AppCompatActivity() {
 
     // ----------------------------------------------------------------- frames
 
-    private fun onFrame(frame: GuidanceFrame, width: Int, height: Int) {
+    private fun onFrame(frame: GuidanceFrame, width: Int, height: Int, blur: Bitmap?) {
         if (isFinishing) return
         lastFrame = frame
         binding.overlay.update(frame, width, height)
@@ -466,58 +481,69 @@ class MainActivity : AppCompatActivity() {
 
         autoMeterOnFace(frame, now)
         updateExposure(frame, now)
-        showPreviewFilter(effectiveFilter(frame))
+        showLook(effectiveFilter(frame))
+        showBlur(blur)
 
-        // Scene label, short like a phone maker's "AI" badge.
-        binding.sceneChip.visibility = if (subject != null) View.VISIBLE else View.GONE
-        binding.sceneChip.text = frame.scene.substringBefore(" · ")
+        // Scene badge, like a phone maker's "AI" label: "美食 · 披萨", "狗 · 柯基", "蓝天".
+        binding.sceneChip.visibility = if (frame.sceneLabel.isNotEmpty()) View.VISIBLE else View.GONE
+        binding.sceneChip.text = frame.sceneLabel
         renderLookChips(frame)
 
-        val showStyles = assistOn && subject?.kind == SubjectKind.PERSON
-        binding.styleChips.visibility = if (showStyles) View.VISIBLE else View.INVISIBLE
+        val person = subject?.kind == SubjectKind.PERSON
+        binding.styleChips.visibility = if (person) View.VISIBLE else View.INVISIBLE
+        binding.chipClose.visibility = if (assistOn) View.VISIBLE else View.GONE
+        binding.chipScene.visibility = if (assistOn) View.VISIBLE else View.GONE
 
         showHint(hintFor(frame, now))
     }
 
-    /** One short line at a time: the current step, then (once framed) a pose tip or a light problem. */
+    /**
+     * One short line at a time: the current step; once framed a pose, angle or light tip; with
+     * nothing to aim at, a tip for the scene.
+     */
     private fun hintFor(frame: GuidanceFrame, now: Long): String {
         val aim = frame.composition.aim
         val poseTip = poseTipStabilizer.update(now, frame.poseTips.filter { it.severity != Severity.INFO })
             .firstOrNull()?.text
         val lightTip = frame.lighting?.let {
             when {
-                it.mean < 45f -> "光线太暗，靠近光源或开灯"
+                it.mean < 45f && frame.sceneKind != SceneKind.NIGHT -> "光线太暗，靠近光源或开灯"
                 it.highRatio > 0.2f -> "画面太亮，换个角度避开强光"
                 else -> null
             }
         }
-        if (!assistOn) return lightTip ?: ""
+        val sceneTip = SceneRecognizer.tip(frame.sceneKind)
+        if (!assistOn) return lightTip ?: sceneTip ?: ""
+        val angleTip = aim.angle?.text
         return when (aim.phase) {
-            AimPhase.IDLE -> lightTip ?: if (frame.composition.subject == null) "对准想拍的人或物" else ""
-            AimPhase.DONE -> if (now - doneSince < 1500) doneHint(frame) else poseTip ?: lightTip ?: doneHint(frame)
+            AimPhase.IDLE -> lightTip ?: angleTip ?: sceneTip
+                ?: if (frame.sceneKind == SceneKind.UNKNOWN) "对准想拍的人或物" else ""
+            AimPhase.DONE -> if (now - doneSince < 1500) doneHint(frame) else poseTip ?: angleTip ?: lightTip ?: doneHint(frame)
             else -> aim.hint
         }
     }
 
-    /** "Framed", plus what the camera did about it. */
+    /** "Framed", plus what the camera does about it. */
     private fun doneHint(frame: GuidanceFrame): String {
-        val look = frame.look
-        if (!look.engaged) return frame.composition.aim.hint
         val parts = ArrayList<String>()
-        look.crop?.let { parts += "裁成 ${it.label}" }
+        frame.look.takeIf { it.engaged }?.crop?.let { parts += "裁成 ${it.label}" }
+        if (bokehOn && frame.composition.subject?.kind == SubjectKind.PERSON) parts += "背景虚化"
         val filter = effectiveFilter(frame)
-        if (filter != Filter.NONE) parts += "${filter.label}滤镜"
+        if (filter != Filter.NONE) parts += "${filter.label}风格"
         if (parts.isEmpty()) return frame.composition.aim.hint
         return "构图完成（${parts.joinToString("、")}），可以拍了"
     }
 
     // ------------------------------------------------------------ auto look
 
-    /** The user's filter, or once framed the one that suits the scene. */
+    /** The user's look, or the one that suits the recognised scene. */
     private fun effectiveFilter(frame: GuidanceFrame?): Filter =
-        filterChoice ?: if (frame != null && enhanceOn && frame.look.engaged) frame.look.filter else Filter.NONE
+        filterChoice ?: if (frame != null && enhanceOn) frame.look.filter else Filter.NONE
 
-    /** Once framed, brightens or darkens a third of a stop at a time until the subject is well exposed. */
+    /**
+     * Brightens or darkens a third of a stop at a time until the subject (or the scene: white snow,
+     * a rich sunset) is well exposed. A new scene starts again from the camera's own exposure.
+     */
     private fun updateExposure(frame: GuidanceFrame, now: Long) {
         val cam = camera ?: return
         // Leave exposure alone while taking a photo, and for a while after the user tapped to meter.
@@ -525,7 +551,9 @@ class MainActivity : AppCompatActivity() {
         val state = cam.cameraInfo.exposureState
         if (!state.isExposureCompensationSupported) return
         val range = state.exposureCompensationRange
-        val active = enhanceOn && frame.look.engaged
+        val sceneChanged = frame.sceneKind != exposureScene
+        exposureScene = frame.sceneKind
+        val active = enhanceOn && !sceneChanged
         exposureAssist.update(now, frame.look.exposure, active, range.lower..range.upper, state.exposureCompensationStep.toFloat())
             ?.let { cam.cameraControl.setExposureCompensationIndex(it) }
         analyzer.evBias = currentEv()
@@ -539,8 +567,8 @@ class MainActivity : AppCompatActivity() {
 
     /** What the camera is doing about the light right now, e.g. "闪光补光 · 提亮 +0.7EV". */
     private fun lightActions(frame: GuidanceFrame): List<String> {
+        if (!enhanceOn) return emptyList()
         val look = frame.look
-        if (!look.engaged) return emptyList()
         val out = ArrayList<String>()
         if (look.flash && analyzer.hasFlash) out += if (lensFacing == CameraSelector.LENS_FACING_FRONT) "屏幕补光" else "闪光补光"
         val ev = currentEv()
@@ -553,9 +581,9 @@ class MainActivity : AppCompatActivity() {
         val filter = effectiveFilter(frame)
         binding.filterChip.visibility = View.VISIBLE
         binding.filterChip.text = when {
-            filterChoice != null -> "滤镜 · ${filter.label}"
-            filter != Filter.NONE -> "滤镜 · ${filter.label}（自动）"
-            else -> "滤镜 · 自动"
+            filterChoice != null -> "风格 · ${filter.label}"
+            filter != Filter.NONE -> "风格 · ${filter.label}（自动）"
+            else -> "风格 · 自动"
         }
         val light = frame?.let { lightActions(it) } ?: emptyList()
         val backlit = frame?.lighting?.backlit == true && frame.composition.subject?.kind == SubjectKind.PERSON
@@ -563,39 +591,69 @@ class MainActivity : AppCompatActivity() {
         binding.lightBadge.text = if (light.isNotEmpty()) light.joinToString(" · ") else getString(R.string.backlight_fix)
     }
 
-    /** Tap the filter chip: automatic, then each filter in turn. */
+    /** Tap the style chip: automatic, then each hand-picked look in turn. */
     private fun nextFilter() {
-        val order = listOf<Filter?>(null) + Filter.entries
+        val order = listOf<Filter?>(null) + Filter.MANUAL
         filterChoice = order[(order.indexOf(filterChoice) + 1) % order.size]
         saveSettings()
-        showPreviewFilter(effectiveFilter(lastFrame))
+        showLook(effectiveFilter(lastFrame))
         renderLookChips(lastFrame)
     }
 
-    /** Shows the filter on the live preview, fading between looks. */
-    private fun showPreviewFilter(f: Filter) {
+    /** Shows the look on the live preview, fading between looks. */
+    private fun showLook(f: Filter) {
         if (f == previewFilter) return
         previewFilter = f
-        val from = previewMatrix
-        val to = ColorMatrices.forFilter(f)
+        val from = previewLook
+        val to = f.params
         filterAnimator?.cancel()
         filterAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 300
-            addUpdateListener { setPreviewMatrix(ColorMatrices.lerp(from, to, it.animatedValue as Float)) }
+            addUpdateListener { applyLook(lerp(from, to, it.animatedValue as Float)) }
             start()
         }
     }
 
-    /** The preview is a TextureView, so a colour filter on its layer recolours the live picture. */
-    private fun setPreviewMatrix(m: FloatArray) {
-        previewMatrix = m
-        val pv = binding.previewView
-        if (m.contentEquals(ColorMatrices.IDENTITY)) {
-            if (pv.layerType != View.LAYER_TYPE_NONE) pv.setLayerType(View.LAYER_TYPE_NONE, null)
+    /**
+     * The preview is a TextureView, so an effect on its container recolours the live picture (and
+     * the blur layer). Android 13+ runs the exact look as a GPU shader; older phones get the
+     * closest colour matrix.
+     */
+    private fun applyLook(p: LookParams) {
+        previewLook = p
+        val v = binding.previewContainer
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !shaderFailed) {
+            try {
+                v.setRenderEffect(if (p.isIdentity) null else LookEffects.renderEffect(p))
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "look shader unavailable, using a colour matrix", e)
+                shaderFailed = true
+                v.setRenderEffect(null)
+            }
+        }
+        if (p.isIdentity) {
+            if (v.layerType != View.LAYER_TYPE_NONE) v.setLayerType(View.LAYER_TYPE_NONE, null)
             return
         }
-        layerPaint.colorFilter = ColorMatrixColorFilter(m)
-        if (pv.layerType != View.LAYER_TYPE_HARDWARE) pv.setLayerType(View.LAYER_TYPE_HARDWARE, layerPaint) else pv.setLayerPaint(layerPaint)
+        layerPaint.colorFilter = ColorMatrixColorFilter(ColorMatrices.approximate(p))
+        if (v.layerType != View.LAYER_TYPE_HARDWARE) v.setLayerType(View.LAYER_TYPE_HARDWARE, layerPaint) else v.setLayerPaint(layerPaint)
+    }
+
+    /**
+     * Portrait blur in the live picture: the blurred background is laid over the sharp preview. It
+     * lags a frame or two behind, so it only shows while the phone is held still.
+     */
+    private fun showBlur(blur: Bitmap?) {
+        val v = binding.blurLayer
+        if (blur != null) v.setImageBitmap(blur)
+        val show = blur != null && bokehOn && levelSensor.isSteady
+        val target = if (show) 1f else 0f
+        if (v.tag != target) {
+            v.tag = target
+            v.animate().cancel()
+            v.animate().alpha(target).setDuration(if (show) 250 else 120).start()
+        }
     }
 
     private fun showHint(text: String) {
@@ -721,12 +779,15 @@ class MainActivity : AppCompatActivity() {
         val front = lensFacing == CameraSelector.LENS_FACING_FRONT
 
         // The latest framing, if the shot is still framed; otherwise what was on screen at the press.
-        val frame = lastFrame?.takeIf { it.look.engaged } ?: pressed
-        val look = frame?.look?.takeIf { it.engaged && enhanceOn }
-        val edits = PhotoEdits(look?.crop?.rect, effectiveFilter(frame), look?.softFill ?: 0f)
+        val frame = lastFrame?.takeIf { it.look.engaged } ?: pressed ?: lastFrame
+        val look = frame?.look?.takeIf { enhanceOn }
+        val crop = look?.takeIf { it.engaged }?.crop
+        val person = frame?.composition?.subject?.kind == SubjectKind.PERSON
+        val edits = PhotoEdits(crop?.rect, effectiveFilter(frame), look?.softFill ?: 0f, bokeh = bokehOn && person)
         val flash = look?.flash == true && analyzer.hasFlash
         setFlash(capture, flash, front)
-        val editText = describeEdits(edits, look?.crop?.label, flash, front)
+        val ev = currentEv()
+        val editText = describeEdits(edits, crop?.label, flash, front, ev)
 
         // Remember what the camera saw, for the review in the gallery.
         if (frame != null) {
@@ -763,7 +824,16 @@ class MainActivity : AppCompatActivity() {
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                 // The picture is taken; editing it need not hold up the next one.
                 if (!edits.isEmpty) runOnUiThread { capturing = false }
-                val uri = if (edits.isEmpty) output.savedUri else saveEdited(raw, fileName, edits)
+                val uri = if (edits.isEmpty) {
+                    output.savedUri
+                } else {
+                    saveEdited(raw, fileName, edits) { blurred ->
+                        // Nobody found to keep sharp: say so in the review instead of claiming a blur.
+                        if (edits.bokeh && !blurred) {
+                            reviews.setEdits(fileName, describeEdits(edits.copy(bokeh = false), crop?.label, flash, front, ev))
+                        }
+                    }
+                }
                 val blurry = uri != null && isBlurry(uri)
                 if (blurry) reviews.markBlurry(fileName)
                 runOnUiThread {
@@ -811,12 +881,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun describeEdits(edits: PhotoEdits, cropLabel: String?, flash: Boolean, front: Boolean): String {
+    private fun describeEdits(edits: PhotoEdits, cropLabel: String?, flash: Boolean, front: Boolean, ev: Float): String {
         val parts = ArrayList<String>()
         if (edits.crop != null && cropLabel != null) parts += "裁成 $cropLabel"
-        if (edits.filter != Filter.NONE) parts += "${edits.filter.label}滤镜"
+        if (edits.bokeh) parts += "背景虚化"
+        if (edits.filter != Filter.NONE) parts += "${edits.filter.label}风格"
         if (flash) parts += if (front) "屏幕补光" else "闪光补光"
-        val ev = currentEv()
         if (abs(ev) >= 0.1f) parts += "%s %+.1fEV".format(if (ev > 0) "提亮" else "压暗", ev)
         if (edits.fill >= 0.1f) parts += "暗部补光"
         return parts.joinToString("、")
@@ -826,14 +896,20 @@ class MainActivity : AppCompatActivity() {
      * Applies the edits to the camera's JPEG and adds the result to the gallery. If editing fails
      * (e.g. not enough memory), the untouched photo is saved instead, so nothing is lost.
      */
-    private fun saveEdited(raw: File, fileName: String, edits: PhotoEdits): Uri? {
+    /**
+     * @param onEdited called with whether the background was blurred, once the edits succeeded (not
+     *   called when the original had to be saved instead).
+     */
+    private fun saveEdited(raw: File, fileName: String, edits: PhotoEdits, onEdited: (blurred: Boolean) -> Unit): Uri? {
         val edited = File(cacheDir, "edited_$fileName")
         try {
             val source = try {
-                PhotoProcessor.process(raw, edited, edits)
+                val blurred = PhotoProcessor.process(raw, edited, edits) { photoSegmenter()?.segment(it) }
+                onEdited(blurred)
                 edited
             } catch (t: Throwable) {
                 Log.e(TAG, "editing failed, saving the original", t)
+                reviews.setEdits(fileName, "")
                 raw
             }
             return insertJpeg(source, fileName)
@@ -843,6 +919,16 @@ class MainActivity : AppCompatActivity() {
         } finally {
             raw.delete()
             edited.delete()
+        }
+    }
+
+    private fun photoSegmenter(): PersonSegmenter? {
+        photoSegmenter?.let { return it }
+        return try {
+            PersonSegmenter(this).also { photoSegmenter = it }
+        } catch (t: Throwable) {
+            Log.e(TAG, "segmentation model failed to load", t)
+            null
         }
     }
 
@@ -1102,7 +1188,7 @@ class MainActivity : AppCompatActivity() {
             analyzer.enhance = enhanceOn
             saveSettings()
             renderSettings()
-            toast(if (enhanceOn) "对准后自动裁剪、调光补光、加滤镜" else "已关闭自动美化，照片保持原样")
+            toast(if (enhanceOn) "按场景自动调色、调光补光，对准后自动裁剪" else "已关闭自动美化，照片保持原样")
         }
         binding.filterChip.setOnClickListener { nextFilter() }
         binding.btnAi.setOnClickListener { requestAdvice() }
@@ -1113,6 +1199,12 @@ class MainActivity : AppCompatActivity() {
         binding.adviceClose.setOnClickListener { closeAdvice() }
         binding.chipClose.setOnClickListener { chooseStyle(PortraitStyle.CLOSE) }
         binding.chipScene.setOnClickListener { chooseStyle(PortraitStyle.SCENE) }
+        binding.chipBlur.setOnClickListener {
+            bokehOn = !bokehOn
+            analyzer.bokeh = bokehOn
+            saveSettings()
+            renderSettings()
+        }
 
         // Tap to focus/meter, pinch to zoom.
         val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -1166,6 +1258,7 @@ class MainActivity : AppCompatActivity() {
         )
         binding.chipClose.isSelected = style == PortraitStyle.CLOSE
         binding.chipScene.isSelected = style == PortraitStyle.SCENE
+        binding.chipBlur.isSelected = bokehOn
         if (!assistOn) binding.overlay.clear()
         if (voiceOn) ensureSpeaker()
     }
@@ -1181,6 +1274,7 @@ class MainActivity : AppCompatActivity() {
         voiceOn = prefs.getBoolean("voice2", false)
         style = PortraitStyle.entries.getOrNull(prefs.getInt("style", 0)) ?: PortraitStyle.CLOSE
         enhanceOn = prefs.getBoolean("enhance", true)
+        bokehOn = prefs.getBoolean("bokeh", true)
         filterChoice = Filter.entries.getOrNull(prefs.getInt("filter", -1))
     }
 
@@ -1192,6 +1286,7 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("voice2", voiceOn)
             .putInt("style", style.ordinal)
             .putBoolean("enhance", enhanceOn)
+            .putBoolean("bokeh", bokehOn)
             .putInt("filter", filterChoice?.ordinal ?: -1)
             .apply()
     }
@@ -1223,6 +1318,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "AICamera"
         /** Beyond this the assistant does not zoom on its own (digital zoom gets soft). */
-        private const val MAX_ASSIST_ZOOM = 3f
+        private const val MAX_ASSIST_ZOOM = 2f
     }
 }

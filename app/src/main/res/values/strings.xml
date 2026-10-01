@@ -8,6 +8,7 @@
     <string name="backlight_fix">逆光优化</string>
     <string name="style_close">人物特写</string>
     <string name="style_scene">人景合一</string>
+    <string name="style_blur">背景虚化</string>
     <string name="no_photos">还没有用这个 App 拍过照片</string>
     <string name="back">返回</string>
     <string name="share">分享</string>

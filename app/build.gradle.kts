@@ -46,9 +46,12 @@ android {
         viewBinding = true
     }
 
-    // Compress native libraries to keep the download small.
+    // Compress native libraries and code to keep the download small.
     packaging {
         jniLibs {
+            useLegacyPackaging = true
+        }
+        dex {
             useLegacyPackaging = true
         }
     }

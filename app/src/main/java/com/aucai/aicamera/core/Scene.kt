@@ -217,26 +217,21 @@ object SceneLight {
 /** A one-line description of what the camera sees. */
 object SceneAdvisor {
 
-    fun describe(subject: Subject?, shot: ShotType?, lighting: LightingResult?): String {
-        val parts = ArrayList<String>()
-        when (subject?.kind) {
-            SubjectKind.PERSON -> {
-                parts += "人像"
-                parts += when (shot) {
-                    ShotType.CLOSE_UP -> "特写"
-                    ShotType.HALF_BODY -> "半身"
-                    ShotType.FULL_BODY -> "全身"
-                    null -> "人物"
-                }
+    /** E.g. "美食 · 披萨", "人像 · 半身 · 逆光", "蓝天". */
+    fun describe(scene: SceneGuess, shot: ShotType?, lighting: LightingResult?): String {
+        if (scene.kind == SceneKind.UNKNOWN) return "没认出场景"
+        val parts = arrayListOf(scene.kind.label)
+        if (scene.kind == SceneKind.PORTRAIT) {
+            parts += when (shot) {
+                ShotType.CLOSE_UP -> "特写"
+                ShotType.HALF_BODY -> "半身"
+                ShotType.FULL_BODY -> "全身"
+                null -> "人物"
             }
-            SubjectKind.OBJECT -> {
-                parts += subject.group?.label ?: "物品"
-                parts += subject.label
-            }
-            SubjectKind.HORIZON -> parts += "风景"
-            null -> parts += "没找到主体"
+        } else {
+            scene.detail?.let { parts += it }
         }
-        if (lighting != null) {
+        if (lighting != null && scene.kind != SceneKind.NIGHT) {
             when {
                 lighting.backlit -> parts += "逆光"
                 lighting.mean < 50f -> parts += "暗光"
